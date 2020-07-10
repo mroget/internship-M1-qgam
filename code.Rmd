@@ -1,0 +1,1507 @@
+---
+title: "Simulation Qgam"
+header-includes:
+   - \usepackage{amsfonts}
+   - \usepackage{amsmath}
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    theme: united
+    highlight: tango
+    fig_width: 14
+    fig_height: 8
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    code_folding: hide
+---
+
+Here the required libraries for this document
+```{r results='hide',message=FALSE}
+library(gamair);library(mgcv);library(parallel); library(MASS);library(doSNOW);library(tcltk);library(evd);library(foreach);library(stringr);library(dplyr);library(qgam)
+```
+
+# Simulation #
+
+## Data generation ##
+
+### Data generation model ###
+We have two models of data generation, one for Gaussian distribution and another one for gev distribution. Each model consists of 4 functions that describes the distribution (plaw,rlaw,dlaw,qlaw) and a set of entries x. 
+
+The function bellows allow us to create a model of the form $y_i \sim \mathcal{N}(\mu(x_i),\sigma(x_i)^2)$ for the given functions $\mu$ and $\sigma$.
+```{r}
+get_model.gauss = function(mu,sig,x){
+    model=NULL
+    model$mu=mu
+    model$sd=if(mode(sig) == "numeric"){function(x){sig}}else{sig}
+    
+    model$plaw = function(q,x){pnorm(q,model$mu(x),model$sd(x))}
+    model$rlaw = function(n,x){rnorm(n,model$mu(x),model$sd(x))}
+    model$dlaw = function(x){dnorm(x,model$mu(x),model$sd(x))}
+    model$qlaw = function(p,x){qnorm(p,model$mu(x),model$sd(x))}
+
+    model$x = x
+
+    model
+}
+```
+
+This other function allows us to create a model of the form $y_i \sim \text{GEV}(\text{loc}(x_i),\text{scale}(x_i),\text{shape})$ for the given functions $\text{loc}$ and $\text{scale}$ and the constant $\text{shape}$.
+```{r}
+get_model.gev = function(loc,scale,shape,x){
+    model=NULL
+    
+    model$plaw = function(q,x){pgev(q,loc(x),scale(x),shape)}
+    model$rlaw = function(n,x){rgev(n,loc(x),scale(x),shape)}
+    model$dlaw = function(x){dgev(x,loc(x),scale(x),shape)}
+    model$qlaw = function(p,x){qgev(p,loc(x),scale(x),shape)}
+
+    model$x = x
+
+    model
+}
+```
+
+
+### Generation ###
+
+Now we have a function that takes a model and generate a dataset. More precisely, this function takes randomly some $x_i \in model\$x$ and generate the corresponding $y_i$. The function does this twice, one time for generating a training dataset and another time for the testing dataset. By default, the two datasets are the same and contains 1000 entries, but this can be modified with the arguments. We can also specify a period for the $x_i$.
+
+```{r}
+gen_data = function(model,train_dataset_size=1000, test_dataset_size=train_dataset_size, test_same_train=TRUE, period=0){
+    x_train = sample(model$x,train_dataset_size)
+    if(test_same_train){
+        test_dataset_size = train_dataset_size
+        x_test = x_train
+    } else{
+        x_test = sample(model$x,test_dataset_size)
+    }
+    
+    y_train = model$rlaw(train_dataset_size,x_train)
+    y_test = model$rlaw(test_dataset_size,x_test)
+
+    if(period>0){x_test = x_test %% period; x_train = x_train %% period}
+
+    data = NULL
+    data$train = data.frame(x=x_train, y=y_train)
+    data$test = data.frame(x=x_test, y=y_test)
+    
+    data
+}
+```
+
+## Regression ##
+This function takes a gam object and return the confidence interval. We can set the covariance matrix used and specified new data.
+
+If we have $V_\beta$ the covariance matrix of the parameters beta (and $\mu = X\beta$ the mean or the quantile we are looking for) then the covariance matrix of $\mu$ is $V_\mu = X V_\beta X^T$. Then the confidence interval $\text{se} = \text{diag}(\sqrt{V_\mu})$.
+
+In a gam object, there are three estimations of $V_\beta$ : 
+
+- $V_e$ : Frequentist estimation
+- $V_p$ : Bayesian estimation (used by default)
+- $V_c$ : Corrected bayesian estimation with bootstrap
+```{r}
+give_se = function(mod,cov = "Vp",new_data=NULL){
+    X = if(length(new_data) != 0){predict(mod,new_data,type="lpmatrix")}else{predict(mod,type="lpmatrix")}
+    if (cov=="Vp"){diag(sqrt(X %*% mod$Vp %*% t(X)))}
+    else if(cov=="Vc"){diag(sqrt(X %*% mod$Vc %*% t(X)))}
+    else {diag(sqrt(X %*% mod$Ve %*% t(X)))}
+}
+```
+
+This function performs a regression with qgam.
+```{r}
+regression.qgam = function(qu, data, form, control = list(), h=-1){
+    mod = if(h<0){qgam(form,data$train,qu,control = control)}else{qgam(form,data$train,qu,control = control,err=h)}
+        
+    fit = predict(mod,data$test)
+    Ve = give_se(mod,new_data=data$test,cov="Ve")
+    Vp = give_se(mod,new_data=data$test,cov="Vp")
+    Vc = give_se(mod,new_data=data$test,cov="Vc")
+    
+    cbind(data$test,data.frame(qu=qu,fit=fit,Ve=Ve,Vp=Vp,Vc=Vc))
+}
+```
+
+## Residuals computation ##
+In this section we note $\tau$ the quantile we are looking for, $\mu$ the value quantile we are looking for and $\widehat{\mu}$ the predicted value. The argument `pred` is the result of one or multiple regression and contain in each row $\tau$ (`pred$qu`) and $\widehat{\mu}$ (`pred$fit`). 
+We also assume that the data follow a law given by `model` and we have 
+
+- $f(x)$ : the distribution function (`model$dlaw`)
+- $F(q,x)$ : the repartition function (`model$plaw`)
+- $F^{-1}(p,x)$ : the quantile function (`model$qlaw`)
+
+We recall that the x in argument is one of the $x_i$ and is used to specify the parameters of the distribution.
+
+### True residual ###
+The true residual $\text{res}$ is given by $\text{res} = \widehat{\mu} - \mu = \widehat{\mu} - F^{-1}(\tau,x)$.
+```{r}
+get_res.fit_vs_th = function(pred,model){
+    pred$fit-model$qlaw(pred$qu,pred$x)
+}
+```
+
+### Quantile residual ###
+The true residual $\text{res.qu}$ is given by $\text{res.qu} = F(\widehat{\mu},x) - \tau$.
+```{r}
+get_res.quantile_vs_th = function(pred,model){
+    model$plaw(pred$fit,pred$x)-pred$qu
+}
+```
+
+## Simulation ##
+Here is the function I use to make multiple parallel simulations of a data model for multiple quantile regression with qgam.
+```{r}
+simul = function(model,form,nb_cores=1,nb_simul=100,qu=c(0.5,0.9),train_dataset_size=1000, test_dataset_size=train_dataset_size, test_same_train=TRUE, period=0, control=list()){
+    export = c("get_model.gauss","gen_data","give_se","regression.qgam")
+    packages = c("mgcv","gamair","qgam","dplyr","evd","foreach")
+
+    result=NULL
+    result$model=model
+    result$train_dataset_size=train_dataset_size
+    result$test_dataset_size=test_dataset_size
+    result$test_same_train = test_same_train
+    result$period = period
+
+    cl <- makeSOCKcluster(nb_cores)
+    registerDoSNOW(cl)
+    
+    pb <- txtProgressBar(max=nb_simul*length(qu), style=3)
+    progress <- function(n) setTxtProgressBar(pb, n)
+    opts <- list(progress=progress)
+    
+    result$pred =
+        foreach(i = 1:nb_simul,.export=export,.packages=packages,.combine="rbind",.options.snow=opts) %:%
+        foreach(q = qu,.combine="rbind") %dopar%{
+            set.seed(round(q*1000)+i*1000)
+            data = gen_data(model,period=period,train_dataset_size = train_dataset_size, test_dataset_size=test_dataset_size, test_same_train=test_same_train)
+            regression.qgam(q,data,form,,control=control)
+        }
+    
+    parallel::stopCluster(cl)
+    result$pred = result$pred %>% mutate(res = get_res.fit_vs_th(result$pred,model),res.qu = get_res.quantile_vs_th(result$pred,model))
+
+    get_sd = function(se){sqrt(mean(se**2))}
+    result$err = bind_rows(result$pred
+                           %>% mutate(tau=qu)
+                           %>% group_by(tau)
+                           %>% group_map(~{data.frame(qu = .x$qu[1],
+                                                      mean = mean(.x$res),
+                                                      sd = sd(.x$res),
+                                                      mean.qu = mean(.x$res.qu),
+                                                      sd.qu = sd(.x$res.qu),
+                                                      Ve = get_sd(.x$Ve),
+                                                      Vp = get_sd(.x$Vp),
+                                                      Vc = get_sd(.x$Vc))}))
+    
+    result
+}
+```
+
+# Results Visualization #
+
+## List of simulations ##
+### List of data models ###
+
+- sin models 
+  + `model.gauss_sin` : $y_i \sim \mathcal{N}(\pi\sin(x_i/10),0.5)$ and $x_i \in [1,20*\pi]$ 
+  + `model.gev_sin_0` : $y_i \sim \text{GEV}(\pi\sin(x_i/10),0.5,0)$ and $x_i \in [1,20*\pi]$
+  + `model.gev_sin_0.2` : $y_i \sim \text{GEV}(\pi\sin(x_i/10),0.5,0.2)$ and $x_i \in [1,20*\pi]$
+- poly models 
+  + `model.gauss_poly` : $y_i \sim \mathcal{N}(x(x-0.2)(x-0.6),0.5)$ and $x_i \in [0,1]$ 
+  + `model.gev_poly_0` : $y_i \sim \text{GEV}(x(x-0.2)(x-0.6),0.5,0)$ and $x_i \in [0,1]$
+  + `model.gev_poly_0.2` : $y_i \sim \text{GEV}(x(x-0.2)(x-0.6),0.5,0.2)$ and $x_i \in [0,1]$
+- exp models 
+  + `model.gauss_exp` : $y_i \sim \mathcal{N}(e^{2x}-3.75,0.5)$ and $x_i \in [0,1]$ 
+  + `model.gev_exp_0` : $y_i \sim \text{GEV}(e^{2x}-3.75,0.5,0)$ and $x_i \in [0,1]$
+  + `model.gev_exp_0.2` : $y_i \sim \text{GEV}(e^{2x}-3.75,0.5,0.2)$ and $x_i \in [0,1]$
+
+```{r}
+model.gauss_sin = get_model.gauss(function(x){pi*sin(x/10)},0.5,seq(1,20*pi,length.out=100000))
+model.gev_sin_0 = get_model.gev(function(x){pi*sin(x/10)},function(x){0.5},0,seq(1,20*pi,length.out=100000))
+model.gev_sin_0.2 = get_model.gev(function(x){pi*sin(x/10)},function(x){0.5},0.2,seq(1,20*pi,length.out=100000))
+
+model.gauss_poly = get_model.gauss(function(x){x*(x-0.2)*(x-0.6)},0.5,seq(0,1,length.out=100000))
+model.gev_poly_0 = get_model.gev(function(x){x*(x-0.2)*(x-0.6)},function(x){0.5},0,seq(0,1,length.out=100000))
+model.gev_poly_0.2 = get_model.gev(function(x){x*(x-0.2)*(x-0.6)},function(x){0.5},0.2,seq(0,1,length.out=100000))
+
+model.gauss_exp = get_model.gauss(function(x){exp(2*x)-3.75},0.5,seq(0,1,length.out=100000))
+model.gev_exp_0 = get_model.gev(function(x){exp(2*x)-3.75},function(x){0.5},0,seq(0,1,length.out=100000))
+model.gev_exp_0.2 = get_model.gev(function(x){exp(2*x)-3.75},function(x){0.5},0.2,seq(0,1,length.out=100000))
+```
+
+### List of simulation ###
+
+Each result is stored in ./data/ but due to the big size of the resulting files, I have also put a light version (without the pred object which store the result of each simulation) in the folder ./data_light/ . All file.rds in ./data/ have their associated file_light in ./data_light/ .
+
+- Big dataset :
+  - `data/gauss_lin_sin.rds` : 
+	+ model : `model.gauss_sin`
+	+ formula : `y~s(sin(x/10))`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 10000
+  - `data/gauss_lin_sin.rds` : 
+	+ model : `model.gauss_sin`
+	+ formula : `y~s(x)`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 10000
+  - `data/gev_sin_0.rds` : 
+	+ model : `model.gev_sin_0`
+	+ formula : `y~s(x)`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 10000
+- Sin models :
+  - `data/sin/gauss_lin_sin.rds` : 
+	+ model : `model.gauss_sin`
+	+ formula : `y~s(sin(x/10))`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.01,0.03,0.06,0.08,0.1,0.23,0.37,0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 1000
+  - `data/sin/gauss_lin_sin.rds` : 
+	+ model : `model.gauss_sin`
+	+ formula : `y~s(x)`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.01,0.03,0.06,0.08,0.1,0.23,0.37,0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 1000
+  - `data/sin/gev_sin_0.rds` : 
+	+ model : `model.gev_sin_0`
+	+ formula : `y~s(x)`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.01,0.03,0.06,0.08,0.1,0.23,0.37,0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 1000
+  - `data/sin/gev_sin_0.2.rds` : 
+	+ model : `model.gev_sin_0.2`
+	+ formula : `y~s(x)`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.01,0.03,0.06,0.08,0.1,0.23,0.37,0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 1000
+- Poly models :
+  - `data/poly/gauss_lin_poly.rds` : 
+	+ model : `model.gauss_poly`
+	+ formula : `y~s(x*(x-0.2)*(x-0.6))`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.01,0.03,0.06,0.08,0.1,0.23,0.37,0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 1000
+  - `data/poly/gauss_lin_poly.rds` : 
+	+ model : `model.gauss_poly`
+	+ formula : `y~s(x)`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.01,0.03,0.06,0.08,0.1,0.23,0.37,0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 1000
+  - `data/poly/gev_poly_0.rds` : 
+	+ model : `model.gev_poly_0`
+	+ formula : `y~s(x)`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.01,0.03,0.06,0.08,0.1,0.23,0.37,0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 1000
+  - `data/poly/gev_poly_0.2.rds` : 
+	+ model : `model.gev_poly_0.2`
+	+ formula : `y~s(x)`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.01,0.03,0.06,0.08,0.1,0.23,0.37,0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 1000
+- Exp models :
+  - `data/exp/gauss_lin_exp.rds` : 
+	+ model : `model.gauss_exp`
+	+ formula : `y~s(exp(2*x)-3.75)`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.01,0.03,0.06,0.08,0.1,0.23,0.37,0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 1000
+  - `data/exp/gauss_lin_exp.rds` : 
+	+ model : `model.gauss_exp`
+	+ formula : `y~s(x)`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.01,0.03,0.06,0.08,0.1,0.23,0.37,0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 1000
+  - `data/exp/gev_exp_0.rds` : 
+	+ model : `model.gev_exp_0`
+	+ formula : `y~s(x)`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.01,0.03,0.06,0.08,0.1,0.23,0.37,0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 1000
+  - `data/exp/gev_exp_0.2.rds` : 
+	+ model : `model.gev_exp_0.2`
+	+ formula : `y~s(x)`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.01,0.03,0.06,0.08,0.1,0.23,0.37,0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 1000
+
+```{r, eval=FALSE}
+qu = c(seq(0.5,0.9,length.out=4),seq(0.92,0.99,length.out=4))
+
+nb_simul = 10000
+nb_cores = 32
+
+print("gauss lin")
+res = simul(model=model.gauss_sin,form=y~s(sin(x/10)),nb_simul=nb_simul,nb_cores=nb_cores,period=20*pi,train_dataset_size=1000,qu=qu)
+saveRDS(res,file="data/gauss_lin_sin.rds")
+res = NULL
+
+print("gauss")
+res = simul(model=model.gauss_sin,form=y~s(x),nb_simul=nb_simul,nb_cores=nb_cores,period=20*pi,train_dataset_size=1000,qu=qu)
+saveRDS(res,file="data/gauss_sin.rds")
+res = NULL
+
+print("gev chi=0")
+res = simul(model=model.gev_sin_0,form=y~s(x),nb_simul=nb_simul,nb_cores=nb_cores,period=20*pi,train_dataset_size=1000,qu=qu)
+saveRDS(res,file="data/gev_sin_0.rds")
+res = NULL
+
+
+nb_simul = 1000
+nb_cores = 32
+data_set_size = 1000
+qu = c(seq(0.01,0.08,length.out=4),seq(0.1,0.9,length.out=7),seq(0.92,0.99,length.out=4))
+
+print("***********")
+print("*** sin ***")
+print("***********")
+
+print("gauss lin")
+res = simul(model=model.gauss_sin,form=y~s(sin(x/10)),nb_simul=nb_simul,nb_cores=nb_cores,period=20*pi,train_dataset_size=data_set_size,qu=qu)
+saveRDS(res,file="data/sin/gauss_lin_sin.rds")
+res$pred=NULL
+saveRDS(res,file="data_light/sin/gauss_lin_sin_light.rds")
+res = NULL
+
+print("gauss")
+res = simul(model=model.gauss_sin,form=y~s(x),nb_simul=nb_simul,nb_cores=nb_cores,period=20*pi,train_dataset_size=data_set_size,qu=qu)
+saveRDS(res,file="data/sin/gauss_sin.rds")
+res$pred=NULL
+saveRDS(res,file="data_light/sin/gauss_sin_light.rds")
+res = NULL
+
+print("gev chi=0")
+res = simul(model=model.gev_sin_0,form=y~s(x),nb_simul=nb_simul,nb_cores=nb_cores,period=20*pi,train_dataset_size=data_set_size,qu=qu)
+saveRDS(res,file="data/sin/gev_sin_0.rds")
+res$pred=NULL
+saveRDS(res,file="data_light/sin/gev_sin_0_light.rds")
+res = NULL
+
+print("gev chi=0.2")
+res = simul(model=model.gev_sin_0.2,form=y~s(x),nb_simul=nb_simul,nb_cores=nb_cores,period=20*pi,train_dataset_size=data_set_size,qu=qu)
+saveRDS(res,file="data/sin/gev_sin_0.2.rds")
+res$pred=NULL
+saveRDS(res,file="data_light/sin/gev_sin_0.2_light.rds")
+res = NULL
+
+print("************")
+print("*** poly ***")
+print("************")
+
+print("gauss lin")
+res = simul(model=model.gauss_poly,form=y~s(I(x*(x-0.2)*(x-0.6))),nb_simul=nb_simul,nb_cores=nb_cores,train_dataset_size=data_set_size,qu=qu)
+saveRDS(res,file="data/poly/gauss_lin_poly.rds")
+res$pred=NULL
+saveRDS(res,file="data_light/poly/gauss_lin_poly_light.rds")
+res = NULL
+
+print("gauss")
+res = simul(model=model.gauss_poly,form=y~s(x),nb_simul=nb_simul,nb_cores=nb_cores,train_dataset_size=data_set_size,qu=qu)
+saveRDS(res,file="data/poly/gauss_poly.rds")
+res$pred=NULL
+saveRDS(res,file="data_light/poly/gauss_poly_light.rds")
+res = NULL
+
+print("gev chi=0")
+res = simul(model=model.gev_poly_0,form=y~s(x),nb_simul=nb_simul,nb_cores=nb_cores,train_dataset_size=data_set_size,qu=qu)
+saveRDS(res,file="data/poly/gev_poly_0.rds")
+res$pred=NULL
+saveRDS(res,file="data_light/poly/gev_poly_0_light.rds")
+res = NULL
+
+print("gev chi=0.2")
+res = simul(model=model.gev_poly_0.2,form=y~s(x),nb_simul=nb_simul,nb_cores=nb_cores,train_dataset_size=data_set_size,qu=qu)
+saveRDS(res,file="data/poly/gev_poly_0.2.rds")
+res$pred=NULL
+saveRDS(res,file="data_light/poly/gev_poly_0.2_light.rds")
+res = NULL
+
+
+print("***********")
+print("*** exp ***")
+print("***********")
+
+print("gauss lin")
+res = simul(model=model.gauss_exp,form=y~s(I(exp(2*x)-3.75)),nb_simul=nb_simul,nb_cores=nb_cores,train_dataset_size=data_set_size,qu=qu)
+saveRDS(res,file="data/exp/gauss_lin_exp.rds")
+res$pred=NULL
+saveRDS(res,file="data_light/exp/gauss_lin_exp_light.rds")
+res = NULL
+
+print("gauss")
+res = simul(model=model.gauss_exp,form=y~s(x),nb_simul=nb_simul,nb_cores=nb_cores,train_dataset_size=data_set_size,qu=qu)
+saveRDS(res,file="data/exp/gauss_exp.rds")
+res$pred=NULL
+saveRDS(res,file="data_light/exp/gauss_exp_light.rds")
+res = NULL
+
+print("gev chi=0")
+res = simul(model=model.gev_exp_0,form=y~s(x),nb_simul=nb_simul,nb_cores=nb_cores,train_dataset_size=data_set_size,qu=qu)
+saveRDS(res,file="data/exp/gev_exp_0.rds")
+res$pred=NULL
+saveRDS(res,file="data_light/exp/gev_exp_0_light.rds")
+res = NULL
+
+print("gev chi=0.2")
+res = simul(model=model.gev_exp_0.2,form=y~s(x),nb_simul=nb_simul,nb_cores=nb_cores,train_dataset_size=data_set_size,qu=qu)
+saveRDS(res,file="data/exp/gev_exp_0.2.rds")
+res$pred=NULL
+saveRDS(res,file="data_light/exp/gev_exp_0.2_light.rds")
+res = NULL
+
+```
+
+## Load results ##
+Each resulting file takes 4.5 GB so it's not an option to store them on dropbox and load them all at once on a laptop. It's the pred part of the result (which contain $x_i$ and $\mu_i$ for each data of each simulation) that take so much space. So I have saved the results without this part and store them in `./data_light/`.
+
+```{r}
+res.gauss_lin = readRDS("data_light/gauss_lin_sin_light.rds")
+res.gauss = readRDS("data_light/gauss_sin_light.rds")
+res.gev.0 = readRDS("data_light/gev_sin_0_light.rds")
+
+res_1000.sin.gauss_lin = readRDS("data_light/sin/gauss_lin_sin_light.rds")
+res_1000.sin.gauss = readRDS("data_light/sin/gauss_sin_light.rds")
+res_1000.sin.gev.0 = readRDS("data_light/sin/gev_sin_0_light.rds")
+res_1000.sin.gev.0.2 = readRDS("data_light/sin/gev_sin_0.2_light.rds")
+
+res_1000.poly.gauss_lin = readRDS("data_light/poly/gauss_lin_poly_light.rds")
+res_1000.poly.gauss = readRDS("data_light/poly/gauss_poly_light.rds")
+res_1000.poly.gev.0 = readRDS("data_light/poly/gev_poly_0_light.rds")
+res_1000.poly.gev.0.2 = readRDS("data_light/poly/gev_poly_0.2_light.rds")
+
+res_1000.exp.gauss_lin = readRDS("data_light/exp/gauss_lin_exp_light.rds")
+res_1000.exp.gauss = readRDS("data_light/exp/gauss_exp_light.rds")
+res_1000.exp.gev.0 = readRDS("data_light/exp/gev_exp_0_light.rds")
+res_1000.exp.gev.0.2 = readRDS("data_light/exp/gev_exp_0.2_light.rds")
+```
+
+## Print the mean of the residuals ##
+
+### Sin model ###
+Recall : 
+
+- gauss : $y_i \sim \mathcal{N}(\pi\sin(x_i/10),0.5)$ and $x_i \in [1,20*\pi]$
+- gev $\chi=0$ : $y_i \sim \text{GEV}(\pi\sin(x_i/10),0.5,0)$ and $x_i \in [1,20*\pi]$
+- gev $\chi=0.2$ : $y_i \sim \text{GEV}(\pi\sin(x_i/10),0.5,0.2)$ and $x_i \in [1,20*\pi]$
+- dataset size : 1000
+- number of simulations : 1000
+
+Here we plot $\overline{\text{res}}$ for each quantile : 
+```{r}
+plot(res_1000.sin.gauss_lin$err$qu,res_1000.sin.gauss_lin$err$mean,'b',lwd=3,lty="dashed",col=2,main="mean of the residuals for sin model",xlab="tau",ylab="mean of the residuals",ylim=c(-0.05,0.21))
+lines(res_1000.sin.gauss$err$qu,res_1000.sin.gauss$err$mean,'b',lwd=3,lty="dashed",col=3)
+lines(res_1000.sin.gev.0$err$qu,res_1000.sin.gev.0$err$mean,'b',lwd=3,lty="dashed",col=4)
+lines(res_1000.sin.gev.0.2$err$qu,res_1000.sin.gev.0.2$err$mean,'b',lwd=3,lty="dashed",col=5)
+legend(0.1, 0.2, legend=c("gauss lin","gauss","gev chi=0","gev chi=0.2"),col=2:5, lty="dashed", lwd = 3, cex=1.5)
+```
+
+Now the same for $\overline{\text{res.qu}}$ :
+```{r}
+plot(res_1000.sin.gauss_lin$err$qu,res_1000.sin.gauss_lin$err$mean.qu,'b',lwd=3,lty="dashed",col=2,main="mean of the quantile residuals for sin model",xlab="tau",ylab="mean of the residuals",ylim=c(-0.015,0.016))
+lines(res_1000.sin.gauss$err$qu,res_1000.sin.gauss$err$mean.qu,'b',lwd=3,lty="dashed",col=3)
+lines(res_1000.sin.gev.0$err$qu,res_1000.sin.gev.0$err$mean.qu,'b',lwd=3,lty="dashed",col=4)
+lines(res_1000.sin.gev.0.2$err$qu,res_1000.sin.gev.0.2$err$mean.qu,'b',lwd=3,lty="dashed",col=5)
+legend(0.1, 0.015, legend=c("gauss lin","gauss","gev chi=0","gev chi=0.2"),col=2:5, lty="dashed", lwd = 3, cex=1.5)
+```
+
+### Polynomial model ###
+Recall : 
+
+- gauss : $y_i \sim \mathcal{N}(x(x-0.2)(x-0.6),0.5)$ and $x_i \in [0,1]$
+- gev $\chi=0$  : $y_i \sim \text{GEV}(x(x-0.2)(x-0.6),0.5,0)$ and $x_i \in [0,1]$
+- gev $\chi=0.2$ : $y_i \sim \text{GEV}(x(x-0.2)(x-0.6),0.5,0.2)$ and $x_i \in [0,1]$
+- dataset size : 1000
+- number of simulations : 1000
+
+Here we plot $\overline{\text{res}}$ for each quantile : 
+```{r}
+plot(res_1000.poly.gauss_lin$err$qu,res_1000.poly.gauss_lin$err$mean,'b',lwd=3,lty="dashed",col=2,main="mean of the residuals for poly model",xlab="tau",ylab="mean of the residuals",ylim=c(-0.03,0.13))
+lines(res_1000.poly.gauss$err$qu,res_1000.poly.gauss$err$mean,'b',lwd=3,lty="dashed",col=3)
+lines(res_1000.poly.gev.0$err$qu,res_1000.poly.gev.0$err$mean,'b',lwd=3,lty="dashed",col=4)
+lines(res_1000.poly.gev.0.2$err$qu,res_1000.poly.gev.0.2$err$mean,'b',lwd=3,lty="dashed",col=5)
+legend(0.1, 0.12, legend=c("gauss lin","gauss","gev chi=0","gev chi=0.2"),col=2:5, lty="dashed", lwd = 3, cex=1.5)
+```
+
+Now the same for $\overline{\text{res.qu}}$ :
+```{r}
+plot(res_1000.poly.gauss_lin$err$qu,res_1000.poly.gauss_lin$err$mean.qu,'b',lwd=3,lty="dashed",col=2,main="mean of the quantile residuals for poly model",xlab="tau",ylab="mean of the residuals",ylim=c(-0.015,0.016))
+lines(res_1000.poly.gauss$err$qu,res_1000.poly.gauss$err$mean.qu,'b',lwd=3,lty="dashed",col=3)
+lines(res_1000.poly.gev.0$err$qu,res_1000.poly.gev.0$err$mean.qu,'b',lwd=3,lty="dashed",col=4)
+lines(res_1000.poly.gev.0.2$err$qu,res_1000.poly.gev.0.2$err$mean.qu,'b',lwd=3,lty="dashed",col=5)
+legend(0.1, 0.015, legend=c("gauss lin","gauss","gev chi=0","gev chi=0.2"),col=2:5, lty="dashed", lwd = 3, cex=1.5)
+```
+
+### Exponential model ###
+Recall : 
+
+- gauss : $y_i \sim \mathcal{N}(e^{2x}-3.75,0.5)$ and $x_i \in [0,1]$ 
+- gev $\chi=0$ : $y_i \sim \text{GEV}(e^{2x}-3.75,0.5,0)$ and $x_i \in [0,1]$
+- gev $\chi=0.2$ : $y_i \sim \text{GEV}(e^{2x}-3.75,0.5,0.2)$ and $x_i \in [0,1]$
+- dataset size : 1000
+- number of simulations : 1000
+
+Here we plot $\overline{\text{res}}$ for each quantile : 
+```{r}
+plot(res_1000.exp.gauss_lin$err$qu,res_1000.exp.gauss_lin$err$mean,'b',lwd=3,lty="dashed",col=2,main="mean of the residuals for exp model",xlab="tau",ylab="mean of the residuals",ylim=c(-0.03,0.16))
+lines(res_1000.exp.gauss$err$qu,res_1000.exp.gauss$err$mean,'b',lwd=3,lty="dashed",col=3)
+lines(res_1000.exp.gev.0$err$qu,res_1000.exp.gev.0$err$mean,'b',lwd=3,lty="dashed",col=4)
+lines(res_1000.exp.gev.0.2$err$qu,res_1000.exp.gev.0.2$err$mean,'b',lwd=3,lty="dashed",col=5)
+legend(0.1, 0.16, legend=c("gauss lin","gauss","gev chi=0","gev chi=0.2"),col=2:5, lty="dashed", lwd = 3, cex=1.5)
+```
+
+Now the same for $\overline{\text{res.qu}}$ :
+```{r}
+plot(res_1000.exp.gauss_lin$err$qu,res_1000.exp.gauss_lin$err$mean.qu,'b',lwd=3,lty="dashed",col=2,main="mean of the quantile residuals for exp model",xlab="tau",ylab="mean of the residuals",ylim=c(-0.015,0.016))
+lines(res_1000.exp.gauss$err$qu,res_1000.exp.gauss$err$mean.qu,'b',lwd=3,lty="dashed",col=3)
+lines(res_1000.exp.gev.0$err$qu,res_1000.exp.gev.0$err$mean.qu,'b',lwd=3,lty="dashed",col=4)
+lines(res_1000.exp.gev.0.2$err$qu,res_1000.exp.gev.0.2$err$mean.qu,'b',lwd=3,lty="dashed",col=5)
+legend(0.1, 0.015, legend=c("gauss lin","gauss","gev chi=0","gev chi=0.2"),col=2:5, lty="dashed", lwd = 3, cex=1.5)
+```
+
+The mean of the residuals seems to be always positive which is quite odd.
+
+
+## Print the error over the standard deviation ##
+
+We note 
+
+- $\widehat{\sigma}$ : the standard deviation of $\text{res}$ (computed by `sd`)
+- $\sigma_e$ : the standard deviation of $\text{res}$ estimated with the comatrix $V_e$.   $\sigma_e = \sqrt{\frac{1}{N}\sum_{i=1}^N{\text{diag}(\sqrt{X V_e X^T})^2_i}}$
+- $\sigma_p$ : the standard deviation of $\text{res}$ estimated with the comatrix $V_p$.   $\sigma_p = \sqrt{\frac{1}{N}\sum_{i=1}^N{\text{diag}(\sqrt{X V_p X^T})^2_i}}$
+- $\sigma_c$ : the standard deviation of $\text{res}$ estimated with the comatrix $V_c$.   $\sigma_c = \sqrt{\frac{1}{N}\sum_{i=1}^N{\text{diag}(\sqrt{X V_c X^T})^2_i}}$
+
+Then we plot $\frac{\widehat{\sigma}-\sigma_*}{\widehat{\sigma}}$ for $* \in \{e,p,c\}$ :
+
+### Sin model ###
+#### gauss lin ####
+Recall : $y_i \sim \mathcal{N}(\pi\sin(x_i/10),0.5)$ and $x_i \in [1,20*\pi]$
+```{r}
+plot(res_1000.sin.gauss_lin$err$qu,(res_1000.sin.gauss_lin$err$sd-res_1000.sin.gauss_lin$err$Ve)/res_1000.sin.gauss_lin$err$sd,'b',lwd=3,lty="dashed",col=2,main="error on standard deviation for gauss lin",xlab="tau",ylab="error",ylim=c(-0.1,0.25))
+lines(res_1000.sin.gauss_lin$err$qu,(res_1000.sin.gauss_lin$err$sd-res_1000.sin.gauss_lin$err$Vp)/res_1000.sin.gauss_lin$err$sd,'b',lwd=3,lty="dashed",col=3)
+lines(res_1000.sin.gauss_lin$err$qu,(res_1000.sin.gauss_lin$err$sd-res_1000.sin.gauss_lin$err$Vc)/res_1000.sin.gauss_lin$err$sd,'b',lwd=3,lty="dashed",col=4)
+lines(c(-1,2),c(0,0),'b',lwd=1,lty="dashed",col=1)
+legend(0.5, 0.25, legend=c("Ve","Vp","Vc"),col=2:4, lty="dashed", lwd = 3, cex=1.5)
+```
+
+#### gauss ####
+Recall : $y_i \sim \mathcal{N}(\pi\sin(x_i/10),0.5)$ and $x_i \in [1,20*\pi]$
+```{r}
+plot(res_1000.sin.gauss_lin$err$qu,(res_1000.sin.gauss$err$sd-res_1000.sin.gauss$err$Ve)/res_1000.sin.gauss$err$sd,'b',lwd=3,lty="dashed",col=2,main="error on standard deviation for gauss",xlab="tau",ylab="error",ylim=c(-0.02,0.18))
+lines(res_1000.sin.gauss$err$qu,(res_1000.sin.gauss$err$sd-res_1000.sin.gauss$err$Vp)/res_1000.sin.gauss$err$sd,'b',lwd=3,lty="dashed",col=3)
+lines(res_1000.sin.gauss$err$qu,(res_1000.sin.gauss$err$sd-res_1000.sin.gauss$err$Vc)/res_1000.sin.gauss$err$sd,'b',lwd=3,lty="dashed",col=4)
+lines(c(-1,2),c(0,0),'b',lwd=1,lty="dashed",col=1)
+legend(0.5, 0.18, legend=c("Ve","Vp","Vc"),col=2:4, lty="dashed", lwd = 3, cex=1.5)
+```
+
+#### GEV $\chi=0$ ####
+Recall : $y_i \sim \text{GEV}(\pi\sin(x_i/10),0.5,0)$ and $x_i \in [1,20*\pi]$
+```{r}
+plot(res_1000.sin.gev.0$err$qu,(res_1000.sin.gev.0$err$sd-res_1000.sin.gev.0$err$Ve)/res_1000.sin.gev.0$err$sd,'b',lwd=3,lty="dashed",col=2,main="error on standard deviation for gev",xlab="tau",ylab="error",ylim=c(-0.03,0.21))
+lines(res_1000.sin.gev.0$err$qu,(res_1000.sin.gev.0$err$sd-res_1000.sin.gev.0$err$Vp)/res_1000.sin.gev.0$err$sd,'b',lwd=3,lty="dashed",col=3)
+lines(res_1000.sin.gev.0$err$qu,(res_1000.sin.gev.0$err$sd-res_1000.sin.gev.0$err$Vc)/res_1000.sin.gev.0$err$sd,'b',lwd=3,lty="dashed",col=4)
+lines(c(-1,2),c(0,0),'b',lwd=1,lty="dashed",col=1)
+legend(0.5, 0.2, legend=c("Ve","Vp","Vc"),col=2:4, lty="dashed", lwd = 3, cex=1.5)
+```
+
+#### GEV $\chi=0.2$ ####
+Recall : $y_i \sim \text{GEV}(\pi\sin(x_i/10),0.5,0.2)$ and $x_i \in [1,20*\pi]$
+```{r}
+plot(res_1000.sin.gev.0.2$err$qu,(res_1000.sin.gev.0.2$err$sd-res_1000.sin.gev.0.2$err$Ve)/res_1000.sin.gev.0.2$err$sd,'b',lwd=3,lty="dashed",col=2,main="error on standard deviation for gev",xlab="tau",ylab="error",ylim=c(-0.03,0.33))
+lines(res_1000.sin.gev.0.2$err$qu,(res_1000.sin.gev.0.2$err$sd-res_1000.sin.gev.0.2$err$Vp)/res_1000.sin.gev.0.2$err$sd,'b',lwd=3,lty="dashed",col=3)
+lines(res_1000.sin.gev.0.2$err$qu,(res_1000.sin.gev.0.2$err$sd-res_1000.sin.gev.0.2$err$Vc)/res_1000.sin.gev.0.2$err$sd,'b',lwd=3,lty="dashed",col=4)
+lines(c(-1,2),c(0,0),'b',lwd=1,lty="dashed",col=1)
+legend(0.5, 0.2, legend=c("Ve","Vp","Vc"),col=2:4, lty="dashed", lwd = 3, cex=1.5)
+```
+
+
+### Poly model ###
+#### gauss lin ####
+Recall : $y_i \sim \mathcal{N}(x(x-0.2)(x-0.6),0.5)$ and $x_i \in [0,1]$ 
+```{r}
+plot(res_1000.poly.gauss_lin$err$qu,(res_1000.poly.gauss_lin$err$sd-res_1000.poly.gauss_lin$err$Ve)/res_1000.poly.gauss_lin$err$sd,'b',lwd=3,lty="dashed",col=2,main="error on standard deviation for gauss lin",xlab="tau",ylab="error",ylim=c(-0.1,0.25))
+lines(res_1000.poly.gauss_lin$err$qu,(res_1000.poly.gauss_lin$err$sd-res_1000.poly.gauss_lin$err$Vp)/res_1000.poly.gauss_lin$err$sd,'b',lwd=3,lty="dashed",col=3)
+lines(res_1000.poly.gauss_lin$err$qu,(res_1000.poly.gauss_lin$err$sd-res_1000.poly.gauss_lin$err$Vc)/res_1000.poly.gauss_lin$err$sd,'b',lwd=3,lty="dashed",col=4)
+lines(c(-1,2),c(0,0),'b',lwd=1,lty="dashed",col=1)
+legend(0.5, 0.25, legend=c("Ve","Vp","Vc"),col=2:4, lty="dashed", lwd = 3, cex=1.5)
+```
+
+#### gauss ####
+Recall : $y_i \sim \mathcal{N}(x(x-0.2)(x-0.6),0.5)$ and $x_i \in [0,1]$ 
+```{r}
+plot(res_1000.poly.gauss_lin$err$qu,(res_1000.poly.gauss$err$sd-res_1000.poly.gauss$err$Ve)/res_1000.poly.gauss$err$sd,'b',lwd=3,lty="dashed",col=2,main="error on standard deviation for gauss",xlab="tau",ylab="error",ylim=c(-0.03,0.3))
+lines(res_1000.poly.gauss$err$qu,(res_1000.poly.gauss$err$sd-res_1000.poly.gauss$err$Vp)/res_1000.poly.gauss$err$sd,'b',lwd=3,lty="dashed",col=3)
+lines(res_1000.poly.gauss$err$qu,(res_1000.poly.gauss$err$sd-res_1000.poly.gauss$err$Vc)/res_1000.poly.gauss$err$sd,'b',lwd=3,lty="dashed",col=4)
+lines(c(-1,2),c(0,0),'b',lwd=1,lty="dashed",col=1)
+legend(0.5, 0.3, legend=c("Ve","Vp","Vc"),col=2:4, lty="dashed", lwd = 3, cex=1.5)
+```
+
+#### GEV $\chi=0$ ####
+Recall : $y_i \sim \text{GEV}(x(x-0.2)(x-0.6),0.5,0)$ and $x_i \in [0,1]$
+```{r}
+plot(res_1000.poly.gev.0$err$qu,(res_1000.poly.gev.0$err$sd-res_1000.poly.gev.0$err$Ve)/res_1000.poly.gev.0$err$sd,'b',lwd=3,lty="dashed",col=2,main="error on standard deviation for gev",xlab="tau",ylab="error",ylim=c(-0.12,0.3))
+lines(res_1000.poly.gev.0$err$qu,(res_1000.poly.gev.0$err$sd-res_1000.poly.gev.0$err$Vp)/res_1000.poly.gev.0$err$sd,'b',lwd=3,lty="dashed",col=3)
+lines(res_1000.poly.gev.0$err$qu,(res_1000.poly.gev.0$err$sd-res_1000.poly.gev.0$err$Vc)/res_1000.poly.gev.0$err$sd,'b',lwd=3,lty="dashed",col=4)
+lines(c(-1,2),c(0,0),'b',lwd=1,lty="dashed",col=1)
+legend(0.5, 0.3, legend=c("Ve","Vp","Vc"),col=2:4, lty="dashed", lwd = 3, cex=1.5)
+```
+
+#### GEV $\chi=0.2$ ####
+Recall : $y_i \sim \text{GEV}(x(x-0.2)(x-0.6),0.5,0.2)$ and $x_i \in [0,1]$
+```{r}
+plot(res_1000.poly.gev.0.2$err$qu,(res_1000.poly.gev.0.2$err$sd-res_1000.poly.gev.0.2$err$Ve)/res_1000.poly.gev.0.2$err$sd,'b',lwd=3,lty="dashed",col=2,main="error on standard deviation for gev chi=0.2",xlab="tau",ylab="error",ylim=c(-0.03,0.36))
+lines(res_1000.poly.gev.0.2$err$qu,(res_1000.poly.gev.0.2$err$sd-res_1000.poly.gev.0.2$err$Vp)/res_1000.poly.gev.0.2$err$sd,'b',lwd=3,lty="dashed",col=3)
+lines(res_1000.poly.gev.0.2$err$qu,(res_1000.poly.gev.0.2$err$sd-res_1000.poly.gev.0.2$err$Vc)/res_1000.poly.gev.0.2$err$sd,'b',lwd=3,lty="dashed",col=4)
+lines(c(-1,2),c(0,0),'b',lwd=1,lty="dashed",col=1)
+legend(0.5, 0.36, legend=c("Ve","Vp","Vc"),col=2:4, lty="dashed", lwd = 3, cex=1.5)
+```
+
+
+### Exp model ###
+#### gauss lin ####
+Recall : $y_i \sim \mathcal{N}(e^{2x}-3.75,0.5)$ and $x_i \in [0,1]$ 
+```{r}
+plot(res_1000.exp.gauss_lin$err$qu,(res_1000.exp.gauss_lin$err$sd-res_1000.exp.gauss_lin$err$Ve)/res_1000.exp.gauss_lin$err$sd,'b',lwd=3,lty="dashed",col=2,main="error on standard deviation for gauss lin",xlab="tau",ylab="error",ylim=c(-0.1,0.25))
+lines(res_1000.exp.gauss_lin$err$qu,(res_1000.exp.gauss_lin$err$sd-res_1000.exp.gauss_lin$err$Vp)/res_1000.exp.gauss_lin$err$sd,'b',lwd=3,lty="dashed",col=3)
+lines(res_1000.exp.gauss_lin$err$qu,(res_1000.exp.gauss_lin$err$sd-res_1000.exp.gauss_lin$err$Vc)/res_1000.exp.gauss_lin$err$sd,'b',lwd=3,lty="dashed",col=4)
+lines(c(-1,2),c(0,0),'b',lwd=1,lty="dashed",col=1)
+legend(0.5, 0.25, legend=c("Ve","Vp","Vc"),col=2:4, lty="dashed", lwd = 3, cex=1.5)
+```
+
+#### gauss ####
+Recall : $y_i \sim \mathcal{N}(e^{2x}-3.75,0.5)$ and $x_i \in [0,1]$ 
+```{r}
+plot(res_1000.exp.gauss_lin$err$qu,(res_1000.exp.gauss$err$sd-res_1000.exp.gauss$err$Ve)/res_1000.exp.gauss$err$sd,'b',lwd=3,lty="dashed",col=2,main="error on standard deviation for gauss",xlab="tau",ylab="error",ylim=c(-0.06,0.3))
+lines(res_1000.exp.gauss$err$qu,(res_1000.exp.gauss$err$sd-res_1000.exp.gauss$err$Vp)/res_1000.exp.gauss$err$sd,'b',lwd=3,lty="dashed",col=3)
+lines(res_1000.exp.gauss$err$qu,(res_1000.exp.gauss$err$sd-res_1000.exp.gauss$err$Vc)/res_1000.exp.gauss$err$sd,'b',lwd=3,lty="dashed",col=4)
+lines(c(-1,2),c(0,0),'b',lwd=1,lty="dashed",col=1)
+legend(0.5, 0.3, legend=c("Ve","Vp","Vc"),col=2:4, lty="dashed", lwd = 3, cex=1.5)
+```
+
+#### GEV $\chi=0$ ####
+Recall : $y_i \sim \text{GEV}(e^{2x}-3.75,0.5,0)$ and $x_i \in [0,1]$
+```{r}
+plot(res_1000.exp.gev.0$err$qu,(res_1000.exp.gev.0$err$sd-res_1000.exp.gev.0$err$Ve)/res_1000.exp.gev.0$err$sd,'b',lwd=3,lty="dashed",col=2,main="error on standard deviation for gev",xlab="tau",ylab="error",ylim=c(-0.12,0.3))
+lines(res_1000.exp.gev.0$err$qu,(res_1000.exp.gev.0$err$sd-res_1000.exp.gev.0$err$Vp)/res_1000.exp.gev.0$err$sd,'b',lwd=3,lty="dashed",col=3)
+lines(res_1000.exp.gev.0$err$qu,(res_1000.exp.gev.0$err$sd-res_1000.exp.gev.0$err$Vc)/res_1000.exp.gev.0$err$sd,'b',lwd=3,lty="dashed",col=4)
+lines(c(-1,2),c(0,0),'b',lwd=1,lty="dashed",col=1)
+legend(0.5, 0.3, legend=c("Ve","Vp","Vc"),col=2:4, lty="dashed", lwd = 3, cex=1.5)
+```
+
+#### GEV $\chi=0.2$ ####
+Recall : $y_i \sim \text{GEV}(e^{2x}-3.75,0.5,0.2)$ and $x_i \in [0,1]$
+```{r}
+plot(res_1000.exp.gev.0.2$err$qu,(res_1000.exp.gev.0.2$err$sd-res_1000.exp.gev.0.2$err$Ve)/res_1000.exp.gev.0.2$err$sd,'b',lwd=3,lty="dashed",col=2,main="error on standard deviation for gev chi=0.2",xlab="tau",ylab="error",ylim=c(-0.07,0.36))
+lines(res_1000.exp.gev.0.2$err$qu,(res_1000.exp.gev.0.2$err$sd-res_1000.exp.gev.0.2$err$Vp)/res_1000.exp.gev.0.2$err$sd,'b',lwd=3,lty="dashed",col=3)
+lines(res_1000.exp.gev.0.2$err$qu,(res_1000.exp.gev.0.2$err$sd-res_1000.exp.gev.0.2$err$Vc)/res_1000.exp.gev.0.2$err$sd,'b',lwd=3,lty="dashed",col=4)
+lines(c(-1,2),c(0,0),'b',lwd=1,lty="dashed",col=1)
+legend(0.5, 0.36, legend=c("Ve","Vp","Vc"),col=2:4, lty="dashed", lwd = 3, cex=1.5)
+```
+
+# Pinball loss and it's appriximation #
+Here I've tried to show that the approximation of the pinball loss can lead to the bias observed in the previous results.
+
+## Pinball and elf loss ##
+We recall that the pinball loss is given by \[\rho_\tau(z) = \left\{\begin{matrix}(\tau-1)z & \text{if } z<0\\ \tau z & \text{if } z\geq 0\end{matrix}\right.\].
+
+```{r}
+pinball = function(tau){function(x){as.numeric(x<0)*(tau-1)*x+as.numeric(x>=0)*tau*x}}
+```
+But in qgam, it's an approximation called elf loss : \[\tilde{\rho_\tau}(z) = (\tau-1)z + h\ln(1+\exp(\frac{x}{h}))\] for some $h$ computed automatically by qgam.
+```{r}
+elf = function(tau,h){function(y){sapply(y,function(x){(tau-1)*x+if(x>=0){h*(x/h+log(1+exp(-x/h)))}else{h*log(1+exp(x/h))}})}}
+```
+
+Here is a plot of both functions.
+```{r}
+x = seq(-2,2,length.out=1000)
+
+plot(x,pinball(0.9)(x),'l',lwd=2,main="pinball and elf loss",xlab="x",ylab="y")
+lines(x,elf(0.9,0.1)(x),col="red",lwd=2)
+
+legend(0, 1.5, legend=c("pinball","elf"),col=1:2,lwd=3,cex=1.5)
+```
+
+## Quantile regression ##
+
+### Pinball ###
+We define the loss function \[\displaystyle l(\mu) = \int{\rho_\tau(y-\mu)dF(y\mid x)}\] and the quantile $\mu^*$ of level $\tau$ is given by \[\mu^*=\underset{\mu}{\text{argmin}}\;l(\mu)\].
+In practice, an approximation of this integral is computed.
+\[\widehat{\mu}^* = \underset{\mu}{\text{argmin}}\; \sum_{i=1}^n{\rho_\tau(y_i-\mu)}\]
+You can observe that this method introduce no bias.
+
+- searched quantile
+```{r}
+tau = 0.9
+qnorm(tau)
+```
+- approximated value ($\underset{\mu}{\text{argmin}}\;l(\mu)$)
+```{r}
+f = function(y){integrate(function(x){pinball(0.9)(x-y)*dnorm(x)},-Inf,+Inf)$value}
+optimize(f,c(-5,5))$minimum
+```
+
+### Elf ###
+But if we try to do the same with the elf loss we obtain a bias.
+Let's define \[\displaystyle \tilde{l}(\mu) = \int{\tilde{\rho}_\tau(y-\mu)dF(y\mid x)}\] and \[\tilde{\mu}^*=\underset{\mu}{\text{argmin}}\;\tilde{l}(\mu)\], then we can observe a bias between the theoritical value of the quantile and the approximated one.
+
+- searched quantile
+```{r}
+tau = 0.9
+qnorm(tau)
+```
+- approximated value ($\underset{\mu}{\text{argmin}}\;\tilde{l}(\mu)$)
+```{r}
+f = function(y){integrate(function(x){elf(0.9,h=0.1)(x-y)*dnorm(x)},-Inf,+Inf)$value}
+optimize(f,c(-5,5))$minimum
+```
+
+## Correct the bias ##
+I've tried to correct the bias and more precisely to find the good quantile to ask for if we want a regression for the $\tau^{\text{th}}$ quantile. 
+Assume that we want to obtain the $\tau^{\text{th}}$ with the elf loss. According to what we saw above, we will experiment a bias. But, we may use this regression method trying to obtain the $\tilde\tau^{\text{th}}$ quantile to actually obtain the $\tau^{\text{th}}$ quantile we wanted. This can be achieved by taking 
+\[\tilde\tau = 1-\int{\frac{dF_{y\mid x}(y)}{1+\exp(\frac{F_{y\mid x}^{-1}(\tau)-y}{h})}}\]
+*Proof :*
+We define the $\tau^{\text{th}}$ quantile as $\mu^* = F_{y\mid x}^{-1}(\tau)$. The algorithm will find an approximate value of 
+\[\tilde{\mu} = \underset{\mu}{\text{argmin}}\;\tilde{l}(\mu)\; .\]
+Recall that 
+\[
+\begin{split}
+\tilde{l}(\mu) &= \int{\tilde{\rho}_\tau(y-\mu)dF_{y\mid x}} \\
+ &= \int{((\tau-1)(y-\mu) + h\log(1+e^{(y-\mu)/h}))dF_{y\mid x}} \\
+ &= (\tau-1)(\mathbb{E}(y\mid x)-\mu)+ h\int{ \log(1+e^{(y-\mu)/h})dF_{y\mid x}} \\
+\end{split}\; .\]
+Now we want to find the minimum of this function so we derive it.
+\[\frac{\partial \tilde{l}}{\partial\mu} = 1 - \tau - \int{\frac{dF(y\mid x)}{1+e^{\frac{\mu-y}{h}}}}\]
+Now we replace $\tau$ by $\tilde\tau$ and wetry to find a value of $\tilde\tau$ that verify $\displaystyle \frac{\partial \tilde{l}}{\partial\mu}(\mu^*) = 0$ : 
+\[\frac{\partial \tilde{l}}{\partial\mu}(\mu^*) = 0 \Leftrightarrow \tilde\tau = 1-\int{\frac{dF_{y\mid x}(y)}{1+\exp(\frac{F_{y\mid x}^{-1}(\tau)-y}{h})}}\]
+*End of the proof*
+
+***Remark :***
+\[\tilde\tau = 1-\int{\frac{dF_{y\mid x}(y)}{1+\exp(\frac{\mu-y}{h})}}\]
+where $\mu = F_{y\mid x}^{-1}(\tau)$.
+Note that
+\[\underset{h\to 0^+}{\lim}\frac{1}{1+e^{\frac{\mu-y}{h}}} = 
+\left\{\begin{matrix}
+\frac{1}{2} & \text{if } \mu = y\\
+1 & \text{if } \mu < y\\
+0 & \text{if } \mu > y\\
+\end{matrix}\right.
+\;.\]
+So 
+\[ \begin{split}
+\underset{h\to 0^+}{\lim} \tilde\tau &= 1- \int_\mu^{+\infty}{dF_{y\mid x}}\\
+ &= 1-(1-F_{y\mid x}(\mu)) \\
+ &= F_{y\mid x}(\mu)\\
+ &= F_{y\mid x}(F^{-1}_{y\mid x}(\tau))\\
+ &= \tau\\
+\end{split} \]
+
+So we can correct the bias introduced by the elf loss but to do that we need two more informations : the distribution of the data $F_{y\mid x}$ (or its approximation by gam) and the value of $h$.
+
+
+- searched quantile
+```{r}
+tau = 0.9
+qnorm(tau)
+```
+- approximate value ($\underset{\mu}{\text{argmin}}\;\tilde{l}(\mu)$)
+```{r}
+f = function(y){integrate(function(x){elf(0.9,h=0.1)(x-y)*dnorm(x)},-Inf,+Inf)$value}
+optimize(f,c(-5,5))$minimum
+```
+- approximate value with the correction presented in this section
+```{r}
+tau = 0.9
+h=0.1
+find_tau = function(tau){1-integrate(function(x){dnorm(x)/(1+exp((qnorm(tau)-x)/h))},-Inf,+Inf)$value}
+f = function(y){integrate(function(x){elf(find_tau(tau),h)(x-y)*dnorm(x)},-Inf,+Inf)$value}
+optimize(f,c(-5,5))$minimum
+```
+
+ The next step is trying to transpose the correction to the qgam regression and see if it worked.
+
+# Simulation with correction #
+The data generation part is the same as before. I have only performed some minor changes to use another regression algorithm and code the corrected regression as described in the previous part.
+
+## Corrected regression ##
+
+The method with the correction works as follow : 
+
+- I assume that the data follow a normal law.
+- I predict $\sigma(x)$ the standard deviation of the data with gam.
+- I compute $\overline\sigma^2 = \mathbb{E}(\sigma(x))$ (works well here because $\sigma$ is constant).
+- I compute $\tilde\tau$ via the formula of the previous section : $\displaystyle \tilde\tau = 1-\int{\frac{dF_{y\mid x}(y)}{1+\exp(\frac{F_{y\mid x}^{-1}(\tau)-y}{h})}}$ .
+- I predict the $\tilde\tau^{\text{th}}$ quantile with qgam.
+- I return the predictions.
+
+```{r}
+find_tau = function(tau,h,sd=1){1-integrate(function(x){dnorm(x,sd=sd)/(1+exp((qnorm(tau,sd=sd)-x)/h))},-Inf,+Inf)$value}
+
+regression.corrected_qgam = function(qu, data, form, control = list(), h=0.1){
+    mod = gam(form,data=data$train,method="REML")
+    mean = predict(mod,data$test)
+
+    tmp = data.frame(x=data$train$x,y=(data$train$y-mean)**2)
+    mod = gam(form,data=tmp)
+    var = predict(mod,data$test)
+    
+    mod = qgam(form,data$train,find_tau(qu,h,sd=sqrt(mean(var))),control = control,err=h)
+        
+    fit = predict(mod,data$test)
+    Ve = give_se(mod,new_data=data$test,cov="Ve")
+    Vp = give_se(mod,new_data=data$test,cov="Vp")
+    Vc = give_se(mod,new_data=data$test,cov="Vc")
+    
+    cbind(data$test,data.frame(qu=qu,fit=fit,Ve=Ve,Vp=Vp,Vc=Vc))
+}
+```
+
+## Minor changes ##
+I put here the new code for the simulation, which is almost the same as before.
+```{r}
+simul = function(model,form,regr=regression.qgam,nb_cores=1,nb_simul=100,qu=c(0.5,0.9),train_dataset_size=1000, test_dataset_size=train_dataset_size, test_same_train=TRUE, period=0, control=list(), h=0.1){
+    export = c("get_model.gauss","gen_data","give_se","regression.qgam","find_tau","regression.corrected_qgam")
+    packages = c("mgcv","gamair","qgam","dplyr","evd","foreach")
+
+    result=NULL
+    result$model=model
+    result$train_dataset_size=train_dataset_size
+    result$test_dataset_size=test_dataset_size
+    result$test_same_train = test_same_train
+    result$period = period
+    result$control=control
+
+    cl <- makeSOCKcluster(nb_cores)
+    registerDoSNOW(cl)
+    
+    pb <- txtProgressBar(max=nb_simul*length(qu), style=3)
+    progress <- function(n) setTxtProgressBar(pb, n)
+    opts <- list(progress=progress)
+    
+    result$pred =
+        foreach(i = 1:nb_simul,.export=export,.packages=packages,.combine="rbind",.options.snow=opts) %:%
+        foreach(q = qu,.combine="rbind") %dopar%{
+            set.seed(round(q*1000)+i*1000)
+            data = gen_data(model,period=period,train_dataset_size = train_dataset_size, test_dataset_size=test_dataset_size, test_same_train=test_same_train)
+            regr(q,data,form,control=control,h=h)
+        }
+    
+    parallel::stopCluster(cl)
+    result$pred = result$pred %>% mutate(res = get_res.fit_vs_th(result$pred,model),res.qu = get_res.quantile_vs_th(result$pred,model))
+
+    get_sd = function(se){sqrt(mean(se**2))}
+    result$err = bind_rows(result$pred %>% mutate(tau=qu) %>% group_by(tau) %>% group_map(~{data.frame(qu = .x$qu[1],
+                                                                                         mean = mean(.x$res),
+                                                                                         sd = sd(.x$res),
+                                                                                         mean.qu = mean(.x$res.qu),
+                                                                                         sd.qu = sd(.x$res.qu),
+                                                                                         Ve = get_sd(.x$Ve),
+                                                                                         Vp = get_sd(.x$Vp),
+                                                                                         Vc = get_sd(.x$Vc))}))
+    
+    result
+}
+
+```
+
+# Results with correction #
+
+
+## List of simulations ##
+### List of data models ###
+
+- sin models 
+  + `model.gauss_sin` : $y_i \sim \mathcal{N}(\pi\sin(x_i/10),0.5)$ and $x_i \in [1,20*\pi]$ 
+  + `model.gev_sin_0` : $y_i \sim \text{GEV}(\pi\sin(x_i/10),0.5,0)$ and $x_i \in [1,20*\pi]$
+  + `model.gev_sin_0.2` : $y_i \sim \text{GEV}(\pi\sin(x_i/10),0.5,0.2)$ and $x_i \in [1,20*\pi]$
+- poly models 
+  + `model.gauss_poly` : $y_i \sim \mathcal{N}(x(x-0.2)(x-0.6),0.5)$ and $x_i \in [0,1]$ 
+  + `model.gev_poly_0` : $y_i \sim \text{GEV}(x(x-0.2)(x-0.6),0.5,0)$ and $x_i \in [0,1]$
+  + `model.gev_poly_0.2` : $y_i \sim \text{GEV}(x(x-0.2)(x-0.6),0.5,0.2)$ and $x_i \in [0,1]$
+- exp models 
+  + `model.gauss_exp` : $y_i \sim \mathcal{N}(e^{2x}-3.75,0.5)$ and $x_i \in [0,1]$ 
+  + `model.gev_exp_0` : $y_i \sim \text{GEV}(e^{2x}-3.75,0.5,0)$ and $x_i \in [0,1]$
+  + `model.gev_exp_0.2` : $y_i \sim \text{GEV}(e^{2x}-3.75,0.5,0.2)$ and $x_i \in [0,1]$
+
+```{r}
+model.gauss_sin = get_model.gauss(function(x){pi*sin(x/10)},0.5,seq(1,20*pi,length.out=100000))
+model.gev_sin_0 = get_model.gev(function(x){pi*sin(x/10)},function(x){0.5},0,seq(1,20*pi,length.out=100000))
+model.gev_sin_0.2 = get_model.gev(function(x){pi*sin(x/10)},function(x){0.5},0.2,seq(1,20*pi,length.out=100000))
+
+model.gauss_poly = get_model.gauss(function(x){x*(x-0.2)*(x-0.6)},0.5,seq(0,1,length.out=100000))
+model.gev_poly_0 = get_model.gev(function(x){x*(x-0.2)*(x-0.6)},function(x){0.5},0,seq(0,1,length.out=100000))
+model.gev_poly_0.2 = get_model.gev(function(x){x*(x-0.2)*(x-0.6)},function(x){0.5},0.2,seq(0,1,length.out=100000))
+
+model.gauss_exp = get_model.gauss(function(x){exp(2*x)-3.75},0.5,seq(0,1,length.out=100000))
+model.gev_exp_0 = get_model.gev(function(x){exp(2*x)-3.75},function(x){0.5},0,seq(0,1,length.out=100000))
+model.gev_exp_0.2 = get_model.gev(function(x){exp(2*x)-3.75},function(x){0.5},0.2,seq(0,1,length.out=100000))
+```
+
+### List of simulation ###
+
+Same as the first bash of simulation but with another regression algorithm
+
+- Sin models :
+  - `data2/sin/gauss_lin_sin.rds` : 
+	+ model : `model.gauss_sin`
+	+ formula : `y~s(sin(x/10))`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.01,0.03,0.06,0.08,0.1,0.23,0.37,0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 1000
+  - `data2/sin/gauss_lin_sin.rds` : 
+	+ model : `model.gauss_sin`
+	+ formula : `y~s(x)`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.01,0.03,0.06,0.08,0.1,0.23,0.37,0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 1000
+  - `data2/sin/gev_sin_0.rds` : 
+	+ model : `model.gev_sin_0`
+	+ formula : `y~s(x)`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.01,0.03,0.06,0.08,0.1,0.23,0.37,0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 1000
+  - `data2/sin/gev_sin_0.2.rds` : 
+	+ model : `model.gev_sin_0.2`
+	+ formula : `y~s(x)`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.01,0.03,0.06,0.08,0.1,0.23,0.37,0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 1000
+- Poly models :
+  - `data2/poly/gauss_lin_poly.rds` : 
+	+ model : `model.gauss_poly`
+	+ formula : `y~s(x*(x-0.2)*(x-0.6))`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.01,0.03,0.06,0.08,0.1,0.23,0.37,0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 1000
+  - `data2/poly/gauss_lin_poly.rds` : 
+	+ model : `model.gauss_poly`
+	+ formula : `y~s(x)`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.01,0.03,0.06,0.08,0.1,0.23,0.37,0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 1000
+  - `data2/poly/gev_poly_0.rds` : 
+	+ model : `model.gev_poly_0`
+	+ formula : `y~s(x)`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.01,0.03,0.06,0.08,0.1,0.23,0.37,0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 1000
+  - `data2/poly/gev_poly_0.2.rds` : 
+	+ model : `model.gev_poly_0.2`
+	+ formula : `y~s(x)`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.01,0.03,0.06,0.08,0.1,0.23,0.37,0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 1000
+- Exp models :
+  - `data2/exp/gauss_lin_exp.rds` : 
+	+ model : `model.gauss_exp`
+	+ formula : `y~s(exp(2*x)-3.75)`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.01,0.03,0.06,0.08,0.1,0.23,0.37,0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 1000
+  - `data2/exp/gauss_lin_exp.rds` : 
+	+ model : `model.gauss_exp`
+	+ formula : `y~s(x)`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.01,0.03,0.06,0.08,0.1,0.23,0.37,0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 1000
+  - `data2/exp/gev_exp_0.rds` : 
+	+ model : `model.gev_exp_0`
+	+ formula : `y~s(x)`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.01,0.03,0.06,0.08,0.1,0.23,0.37,0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 1000
+  - `data2/exp/gev_exp_0.2.rds` : 
+	+ model : `model.gev_exp_0.2`
+	+ formula : `y~s(x)`
+	+ size of training dataset : 1000
+	+ testing dataset : same than training
+	+ quantile : $\{0.01,0.03,0.06,0.08,0.1,0.23,0.37,0.5,0.63,0.77,0.9,0.92,0.94,0.97,0.99\}$
+	+ number of regression : 1000
+
+```{r, eval=FALSE}
+qu = c(seq(0.01,0.08,length.out=4),seq(0.1,0.9,length.out=7),seq(0.92,0.99,length.out=4))
+
+nb_simul = 1000
+nb_cores = 32
+data_set_size = 1000
+
+
+print("***********")
+print("*** sin ***")
+print("***********")
+
+print("gauss lin")
+res = simul(model=model.gauss_sin,regr=regression.corrected_qgam,form=y~s(sin(x/10)),nb_simul=nb_simul,nb_cores=nb_cores,period=20*pi,train_dataset_size=data_set_size,qu=qu)
+saveRDS(res,file="data2/sin/gauss_lin_sin.rds")
+res$pred=NULL
+saveRDS(res,file="data2_light/sin/gauss_lin_sin_light.rds")
+res = NULL
+
+print("gauss")
+res = simul(model=model.gauss_sin,regr=regression.corrected_qgam,form=y~s(x),nb_simul=nb_simul,nb_cores=nb_cores,period=20*pi,train_dataset_size=data_set_size,qu=qu)
+saveRDS(res,file="data2/sin/gauss_sin.rds")
+res$pred=NULL
+saveRDS(res,file="data2_light/sin/gauss_sin_light.rds")
+res = NULL
+
+print("gev chi=0")
+res = simul(model=model.gev_sin_0,regr=regression.corrected_qgam,form=y~s(x),nb_simul=nb_simul,nb_cores=nb_cores,period=20*pi,train_dataset_size=data_set_size,qu=qu)
+saveRDS(res,file="data2/sin/gev_sin_0.rds")
+res$pred=NULL
+saveRDS(res,file="data2_light/sin/gev_sin_0_light.rds")
+res = NULL
+
+print("gev chi=0.2")
+res = simul(model=model.gev_sin_0.2,regr=regression.corrected_qgam,form=y~s(x),nb_simul=nb_simul,nb_cores=nb_cores,period=20*pi,train_dataset_size=data_set_size,qu=qu)
+saveRDS(res,file="data2/sin/gev_sin_0.2.rds")
+res$pred=NULL
+saveRDS(res,file="data2_light/sin/gev_sin_0.2_light.rds")
+res = NULL
+
+print("************")
+print("*** poly ***")
+print("************")
+
+print("gauss lin")
+res = simul(model=model.gauss_poly,regr=regression.corrected_qgam,form=y~s(I(x*(x-0.2)*(x-0.6))),nb_simul=nb_simul,nb_cores=nb_cores,train_dataset_size=data_set_size,qu=qu)
+saveRDS(res,file="data2/poly/gauss_lin_poly.rds")
+res$pred=NULL
+saveRDS(res,file="data2_light/poly/gauss_lin_poly_light.rds")
+res = NULL
+
+print("gauss")
+res = simul(model=model.gauss_poly,regr=regression.corrected_qgam,form=y~s(x),nb_simul=nb_simul,nb_cores=nb_cores,train_dataset_size=data_set_size,qu=qu)
+saveRDS(res,file="data2/poly/gauss_poly.rds")
+res$pred=NULL
+saveRDS(res,file="data2_light/poly/gauss_poly_light.rds")
+res = NULL
+
+print("gev chi=0")
+res = simul(model=model.gev_poly_0,regr=regression.corrected_qgam,form=y~s(x),nb_simul=nb_simul,nb_cores=nb_cores,train_dataset_size=data_set_size,qu=qu)
+saveRDS(res,file="data2/poly/gev_poly_0.rds")
+res$pred=NULL
+saveRDS(res,file="data2_light/poly/gev_poly_0_light.rds")
+res = NULL
+
+print("gev chi=0.2")
+res = simul(model=model.gev_poly_0.2,regr=regression.corrected_qgam,form=y~s(x),nb_simul=nb_simul,nb_cores=nb_cores,train_dataset_size=data_set_size,qu=qu)
+saveRDS(res,file="data2/poly/gev_poly_0.2.rds")
+res$pred=NULL
+saveRDS(res,file="data2_light/poly/gev_poly_0.2_light.rds")
+res = NULL
+
+
+print("***********")
+print("*** exp ***")
+print("***********")
+
+print("gauss lin")
+res = simul(model=model.gauss_exp,regr=regression.corrected_qgam,form=y~s(I(exp(2*x)-3.75)),nb_simul=nb_simul,nb_cores=nb_cores,train_dataset_size=data_set_size,qu=qu)
+saveRDS(res,file="data2/exp/gauss_lin_exp.rds")
+res$pred=NULL
+saveRDS(res,file="data2_light/exp/gauss_lin_exp_light.rds")
+res = NULL
+
+print("gauss")
+res = simul(model=model.gauss_exp,regr=regression.corrected_qgam,form=y~s(x),nb_simul=nb_simul,nb_cores=nb_cores,train_dataset_size=data_set_size,qu=qu)
+saveRDS(res,file="data2/exp/gauss_exp.rds")
+res$pred=NULL
+saveRDS(res,file="data2_light/exp/gauss_exp_light.rds")
+res = NULL
+
+print("gev chi=0")
+res = simul(model=model.gev_exp_0,regr=regression.corrected_qgam,form=y~s(x),nb_simul=nb_simul,nb_cores=nb_cores,train_dataset_size=data_set_size,qu=qu)
+saveRDS(res,file="data2/exp/gev_exp_0.rds")
+res$pred=NULL
+saveRDS(res,file="data2_light/exp/gev_exp_0_light.rds")
+res = NULL
+
+print("gev chi=0.2")
+res = simul(model=model.gev_exp_0.2,regr=regression.corrected_qgam,form=y~s(x),nb_simul=nb_simul,nb_cores=nb_cores,train_dataset_size=data_set_size,qu=qu)
+saveRDS(res,file="data2/exp/gev_exp_0.2.rds")
+res$pred=NULL
+saveRDS(res,file="data2_light/exp/gev_exp_0.2_light.rds")
+res = NULL
+
+
+```
+
+## Load results ##
+Each result file takes 4.5 GB so it's not an option to store them on dropbox and load them all at once on a laptop. It's the pred part of the result (which contain $x_i$ and $\mu_i$ for each data of each simulation) that take so much space. So I have saved the results without this part and store them in `./data2_light/`.
+
+```{r}
+res_corrected_1000.sin.gauss_lin = readRDS("data2_light/sin/gauss_lin_sin_light.rds")
+res_corrected_1000.sin.gauss = readRDS("data2_light/sin/gauss_sin_light.rds")
+res_corrected_1000.sin.gev.0 = readRDS("data2_light/sin/gev_sin_0_light.rds")
+res_corrected_1000.sin.gev.0.2 = readRDS("data2_light/sin/gev_sin_0.2_light.rds")
+
+res_corrected_1000.poly.gauss_lin = readRDS("data2_light/poly/gauss_lin_poly_light.rds")
+res_corrected_1000.poly.gauss = readRDS("data2_light/poly/gauss_poly_light.rds")
+res_corrected_1000.poly.gev.0 = readRDS("data2_light/poly/gev_poly_0_light.rds")
+res_corrected_1000.poly.gev.0.2 = readRDS("data2_light/poly/gev_poly_0.2_light.rds")
+
+res_corrected_1000.exp.gauss_lin = readRDS("data2_light/exp/gauss_lin_exp_light.rds")
+res_corrected_1000.exp.gauss = readRDS("data2_light/exp/gauss_exp_light.rds")
+res_corrected_1000.exp.gev.0 = readRDS("data2_light/exp/gev_exp_0_light.rds")
+res_corrected_1000.exp.gev.0.2 = readRDS("data2_light/exp/gev_exp_0.2_light.rds")
+```
+
+## Print the mean of the residuals ##
+
+### Sin model ###
+Recall : 
+
+- gauss : $y_i \sim \mathcal{N}(\pi\sin(x_i/10),0.5)$ and $x_i \in [1,20*\pi]$
+- gev $\chi=0$ : $y_i \sim \text{GEV}(\pi\sin(x_i/10),0.5,0)$ and $x_i \in [1,20*\pi]$
+- gev $\chi=0.2$ : $y_i \sim \text{GEV}(\pi\sin(x_i/10),0.5,0.2)$ and $x_i \in [1,20*\pi]$
+- dataset size : 1000
+- number of simulations : 1000
+
+Here we plot $\overline{\text{res}}$ for each quantile, the plain tiny lines are a recall of the uncorrected simulations while dashed lines are the results of corrected simulations.
+```{r}
+plot(res_corrected_1000.sin.gauss_lin$err$qu,res_corrected_1000.sin.gauss_lin$err$mean,'b',lwd=3,lty="dashed",col=2,main="mean of the residuals for sin model",xlab="tau",ylab="mean of the residuals",ylim=c(-0.3,0.21))
+lines(res_corrected_1000.sin.gauss$err$qu,res_corrected_1000.sin.gauss$err$mean,'b',lwd=3,lty="dashed",col=3)
+lines(res_corrected_1000.sin.gev.0$err$qu,res_corrected_1000.sin.gev.0$err$mean,'b',lwd=3,lty="dashed",col=4)
+lines(res_corrected_1000.sin.gev.0.2$err$qu,res_corrected_1000.sin.gev.0.2$err$mean,'b',lwd=3,lty="dashed",col=5)
+
+lines(res_1000.sin.gauss_lin$err$qu,res_1000.sin.gauss_lin$err$mean,'l',lwd=1,col=2)
+lines(res_1000.sin.gauss$err$qu,res_1000.sin.gauss$err$mean,'l',lwd=1,col=3)
+lines(res_1000.sin.gev.0$err$qu,res_1000.sin.gev.0$err$mean,'l',lwd=1,col=4)
+lines(res_1000.sin.gev.0.2$err$qu,res_1000.sin.gev.0.2$err$mean,'l',lwd=1,col=5)
+
+lines(c(-1,2),c(0,0),lty='dashed')
+legend(0.1, 0.2, legend=c("gauss lin","gauss","gev chi=0","gev chi=0.2"),col=2:5, lty="dashed", lwd = 3, cex=1.5)
+```
+
+Now the same for $\overline{\text{res.qu}}$ :
+```{r}
+plot(res_corrected_1000.sin.gauss_lin$err$qu,res_corrected_1000.sin.gauss_lin$err$mean.qu,'b',lwd=3,lty="dashed",col=2,main="mean of the quantile residuals for sin model",xlab="tau",ylab="mean of the residuals",ylim=c(-0.04,0.02))
+lines(res_corrected_1000.sin.gauss$err$qu,res_corrected_1000.sin.gauss$err$mean.qu,'b',lwd=3,lty="dashed",col=3)
+lines(res_corrected_1000.sin.gev.0$err$qu,res_corrected_1000.sin.gev.0$err$mean.qu,'b',lwd=3,lty="dashed",col=4)
+lines(res_corrected_1000.sin.gev.0.2$err$qu,res_corrected_1000.sin.gev.0.2$err$mean.qu,'b',lwd=3,lty="dashed",col=5)
+
+lines(res_1000.sin.gauss_lin$err$qu,res_1000.sin.gauss_lin$err$mean.qu,'b',lwd=1,col=2)
+lines(res_1000.sin.gauss$err$qu,res_1000.sin.gauss$err$mean.qu,'b',lwd=1,col=3)
+lines(res_1000.sin.gev.0$err$qu,res_1000.sin.gev.0$err$mean.qu,'b',lwd=1,col=4)
+lines(res_1000.sin.gev.0.2$err$qu,res_1000.sin.gev.0.2$err$mean.qu,'b',lwd=1,col=5)
+
+lines(c(-1,2),c(0,0),lty='dashed')
+legend(0.1, 0.015, legend=c("gauss lin","gauss","gev chi=0","gev chi=0.2"),col=2:5, lty="dashed", lwd = 3, cex=1.5)
+```
+
+### Polynomial model ###
+Recall : 
+
+- gauss : $y_i \sim \mathcal{N}(x(x-0.2)(x-0.6),0.5)$ and $x_i \in [0,1]$
+- gev $\chi=0$  : $y_i \sim \text{GEV}(x(x-0.2)(x-0.6),0.5,0)$ and $x_i \in [0,1]$
+- gev $\chi=0.2$ : $y_i \sim \text{GEV}(x(x-0.2)(x-0.6),0.5,0.2)$ and $x_i \in [0,1]$
+- dataset size : 1000
+- number of simulations : 1000
+
+Here we plot $\overline{\text{res}}$ for each quantile, the plain tiny lines are a recall of the uncorrected simulations while dashed lines are the results of corrected simulations.
+```{r}
+plot(res_corrected_1000.poly.gauss_lin$err$qu,res_corrected_1000.poly.gauss_lin$err$mean,'b',lwd=3,lty="dashed",col=2,main="mean of the residuals for poly model",xlab="tau",ylab="mean of the residuals",ylim=c(-0.3,0.1))
+lines(res_corrected_1000.poly.gauss$err$qu,res_corrected_1000.poly.gauss$err$mean,'b',lwd=3,lty="dashed",col=3)
+lines(res_corrected_1000.poly.gev.0$err$qu,res_corrected_1000.poly.gev.0$err$mean,'b',lwd=3,lty="dashed",col=4)
+lines(res_corrected_1000.poly.gev.0.2$err$qu,res_corrected_1000.poly.gev.0.2$err$mean,'b',lwd=3,lty="dashed",col=5)
+
+lines(res_1000.poly.gauss_lin$err$qu,res_1000.poly.gauss_lin$err$mean,'b',lwd=1,col=2)
+lines(res_1000.poly.gauss$err$qu,res_1000.poly.gauss$err$mean,'b',lwd=1,col=3)
+lines(res_1000.poly.gev.0$err$qu,res_1000.poly.gev.0$err$mean,'b',lwd=1,col=4)
+lines(res_1000.poly.gev.0.2$err$qu,res_1000.poly.gev.0.2$err$mean,'b',lwd=1,col=5)
+
+lines(c(-1,2),c(0,0),lty='dashed')
+legend(0.1, 0.09, legend=c("gauss lin","gauss","gev chi=0","gev chi=0.2"),col=2:5, lty="dashed", lwd = 3, cex=1.5)
+```
+
+Now the same for $\overline{\text{res.qu}}$ :
+```{r}
+plot(res_corrected_1000.poly.gauss_lin$err$qu,res_corrected_1000.poly.gauss_lin$err$mean.qu,'b',lwd=3,lty="dashed",col=2,main="mean of the quantile residuals for poly model",xlab="tau",ylab="mean of the residuals",ylim=c(-0.045,0.02))
+lines(res_corrected_1000.poly.gauss$err$qu,res_corrected_1000.poly.gauss$err$mean.qu,'b',lwd=3,lty="dashed",col=3)
+lines(res_corrected_1000.poly.gev.0$err$qu,res_corrected_1000.poly.gev.0$err$mean.qu,'b',lwd=3,lty="dashed",col=4)
+lines(res_corrected_1000.poly.gev.0.2$err$qu,res_corrected_1000.poly.gev.0.2$err$mean.qu,'b',lwd=3,lty="dashed",col=5)
+
+lines(res_1000.poly.gauss_lin$err$qu,res_1000.poly.gauss_lin$err$mean.qu,'b',lwd=1,col=2)
+lines(res_1000.poly.gauss$err$qu,res_1000.poly.gauss$err$mean.qu,'b',lwd=1,col=3)
+lines(res_1000.poly.gev.0$err$qu,res_1000.poly.gev.0$err$mean.qu,'b',lwd=1,col=4)
+lines(res_1000.poly.gev.0.2$err$qu,res_1000.poly.gev.0.2$err$mean.qu,'b',lwd=1,col=5)
+
+lines(c(-1,2),c(0,0),lty='dashed')
+legend(0.1, 0.015, legend=c("gauss lin","gauss","gev chi=0","gev chi=0.2"),col=2:5, lty="dashed", lwd = 3, cex=1.5)
+```
+
+### Exponential model ###
+Recall : 
+
+- gauss : $y_i \sim \mathcal{N}(e^{2x}-3.75,0.5)$ and $x_i \in [0,1]$ 
+- gev $\chi=0$ : $y_i \sim \text{GEV}(e^{2x}-3.75,0.5,0)$ and $x_i \in [0,1]$
+- gev $\chi=0.2$ : $y_i \sim \text{GEV}(e^{2x}-3.75,0.5,0.2)$ and $x_i \in [0,1]$
+- dataset size : 1000
+- number of simulations : 1000
+
+Here we plot $\overline{\text{res}}$ for each quantile : 
+```{r}
+plot(res_corrected_1000.exp.gauss_lin$err$qu,res_corrected_1000.exp.gauss_lin$err$mean,'b',lwd=3,lty="dashed",col=2,main="mean of the residuals for exp model",xlab="tau",ylab="mean of the residuals",ylim=c(-0.3,0.16))
+lines(res_corrected_1000.exp.gauss$err$qu,res_corrected_1000.exp.gauss$err$mean,'b',lwd=3,lty="dashed",col=3)
+lines(res_corrected_1000.exp.gev.0$err$qu,res_corrected_1000.exp.gev.0$err$mean,'b',lwd=3,lty="dashed",col=4)
+lines(res_corrected_1000.exp.gev.0.2$err$qu,res_corrected_1000.exp.gev.0.2$err$mean,'b',lwd=3,lty="dashed",col=5)
+
+lines(res_1000.exp.gauss_lin$err$qu,res_1000.exp.gauss_lin$err$mean,'b',lwd=1,col=2)
+lines(res_1000.exp.gauss$err$qu,res_1000.exp.gauss$err$mean,'b',lwd=1,col=3)
+lines(res_1000.exp.gev.0$err$qu,res_1000.exp.gev.0$err$mean,'b',lwd=1,col=4)
+lines(res_1000.exp.gev.0.2$err$qu,res_1000.exp.gev.0.2$err$mean,'b',lwd=1,col=5)
+
+lines(c(-1,2),c(0,0),lty='dashed')
+legend(0.1, 0.16, legend=c("gauss lin","gauss","gev chi=0","gev chi=0.2"),col=2:5, lty="dashed", lwd = 3, cex=1.5)
+```
+
+Now the same for $\overline{\text{res.qu}}$ :
+```{r}
+plot(res_corrected_1000.exp.gauss_lin$err$qu,res_corrected_1000.exp.gauss_lin$err$mean.qu,'b',lwd=3,lty="dashed",col=2,main="mean of the quantile residuals for exp model",xlab="tau",ylab="mean of the residuals",ylim=c(-0.04,0.02))
+lines(res_corrected_1000.exp.gauss$err$qu,res_corrected_1000.exp.gauss$err$mean.qu,'b',lwd=3,lty="dashed",col=3)
+lines(res_corrected_1000.exp.gev.0$err$qu,res_corrected_1000.exp.gev.0$err$mean.qu,'b',lwd=3,lty="dashed",col=4)
+lines(res_corrected_1000.exp.gev.0.2$err$qu,res_corrected_1000.exp.gev.0.2$err$mean.qu,'b',lwd=3,lty="dashed",col=5)
+
+lines(res_1000.exp.gauss_lin$err$qu,res_1000.exp.gauss_lin$err$mean.qu,'b',lwd=1,col=2)
+lines(res_1000.exp.gauss$err$qu,res_1000.exp.gauss$err$mean.qu,'b',lwd=1,col=3)
+lines(res_1000.exp.gev.0$err$qu,res_1000.exp.gev.0$err$mean.qu,'b',lwd=1,col=4)
+lines(res_1000.exp.gev.0.2$err$qu,res_1000.exp.gev.0.2$err$mean.qu,'b',lwd=1,col=5)
+
+lines(c(-1,2),c(0,0),lty='dashed')
+legend(0.1, 0.015, legend=c("gauss lin","gauss","gev chi=0","gev chi=0.2"),col=2:5, lty="dashed", lwd = 3, cex=1.5)
+```
+
+
+## Print the error over the standard deviation ##
+
+We note 
+
+- $\widehat{\sigma}$ : the standard deviation of $\text{res}$ (computed by `sd`)
+- $\sigma_e$ : the standard deviation of $\text{res}$ estimated with the comatrix $V_e$.   $\sigma_e = \sqrt{\frac{1}{N}\sum_{i=1}^N{\text{diag}(\sqrt{X V_e X^T})^2_i}}$
+- $\sigma_p$ : the standard deviation of $\text{res}$ estimated with the comatrix $V_p$.   $\sigma_p = \sqrt{\frac{1}{N}\sum_{i=1}^N{\text{diag}(\sqrt{X V_p X^T})^2_i}}$
+- $\sigma_c$ : the standard deviation of $\text{res}$ estimated with the comatrix $V_c$.   $\sigma_c = \sqrt{\frac{1}{N}\sum_{i=1}^N{\text{diag}(\sqrt{X V_c X^T})^2_i}}$
+
+Then we plot $\frac{\widehat{\sigma}-\sigma_*}{\widehat{\sigma}}$ for $* \in \{e,p,c\}$ :
+
+### Sin model ###
+#### gauss lin ####
+Recall : $y_i \sim \mathcal{N}(\pi\sin(x_i/10),0.5)$ and $x_i \in [1,20*\pi]$
+```{r}
+plot(res_corrected_1000.sin.gauss_lin$err$qu,(res_corrected_1000.sin.gauss_lin$err$sd-res_corrected_1000.sin.gauss_lin$err$Ve)/res_corrected_1000.sin.gauss_lin$err$sd,'b',lwd=3,lty="dashed",col=2,main="error on standard deviation for gauss lin",xlab="tau",ylab="error",ylim=c(-0.12,0.25))
+lines(res_corrected_1000.sin.gauss_lin$err$qu,(res_corrected_1000.sin.gauss_lin$err$sd-res_corrected_1000.sin.gauss_lin$err$Vp)/res_corrected_1000.sin.gauss_lin$err$sd,'b',lwd=3,lty="dashed",col=3)
+lines(res_corrected_1000.sin.gauss_lin$err$qu,(res_corrected_1000.sin.gauss_lin$err$sd-res_corrected_1000.sin.gauss_lin$err$Vc)/res_corrected_1000.sin.gauss_lin$err$sd,'b',lwd=3,lty="dashed",col=4)
+
+lines(res_1000.sin.gauss_lin$err$qu,(res_1000.sin.gauss_lin$err$sd-res_1000.sin.gauss_lin$err$Ve)/res_1000.sin.gauss_lin$err$sd,'b',lwd=1,col=2)
+lines(res_1000.sin.gauss_lin$err$qu,(res_1000.sin.gauss_lin$err$sd-res_1000.sin.gauss_lin$err$Vp)/res_1000.sin.gauss_lin$err$sd,'b',lwd=1,col=3)
+lines(res_1000.sin.gauss_lin$err$qu,(res_1000.sin.gauss_lin$err$sd-res_1000.sin.gauss_lin$err$Vc)/res_1000.sin.gauss_lin$err$sd,'b',lwd=1,col=4)
+
+lines(c(-1,2),c(0,0),'b',lwd=1,lty="dashed",col=1)
+legend(0.5, 0.25, legend=c("Ve","Vp","Vc"),col=2:4, lty="dashed", lwd = 3, cex=1.5)
+```
+
+#### gauss ####
+Recall : $y_i \sim \mathcal{N}(\pi\sin(x_i/10),0.5)$ and $x_i \in [1,20*\pi]$
+```{r}
+plot(res_corrected_1000.sin.gauss_lin$err$qu,(res_corrected_1000.sin.gauss$err$sd-res_corrected_1000.sin.gauss$err$Ve)/res_corrected_1000.sin.gauss$err$sd,'b',lwd=3,lty="dashed",col=2,main="error on standard deviation for gauss",xlab="tau",ylab="error",ylim=c(-0.02,0.18))
+lines(res_corrected_1000.sin.gauss$err$qu,(res_corrected_1000.sin.gauss$err$sd-res_corrected_1000.sin.gauss$err$Vp)/res_corrected_1000.sin.gauss$err$sd,'b',lwd=3,lty="dashed",col=3)
+lines(res_corrected_1000.sin.gauss$err$qu,(res_corrected_1000.sin.gauss$err$sd-res_corrected_1000.sin.gauss$err$Vc)/res_corrected_1000.sin.gauss$err$sd,'b',lwd=3,lty="dashed",col=4)
+
+lines(res_1000.sin.gauss$err$qu,(res_1000.sin.gauss$err$sd-res_1000.sin.gauss$err$Ve)/res_1000.sin.gauss$err$sd,'b',lwd=1,col=2)
+lines(res_1000.sin.gauss$err$qu,(res_1000.sin.gauss$err$sd-res_1000.sin.gauss$err$Vp)/res_1000.sin.gauss$err$sd,'b',lwd=1,col=3)
+lines(res_1000.sin.gauss$err$qu,(res_1000.sin.gauss$err$sd-res_1000.sin.gauss$err$Vc)/res_1000.sin.gauss$err$sd,'b',lwd=1,col=4)
+
+lines(c(-1,2),c(0,0),'b',lwd=1,lty="dashed",col=1)
+legend(0.5, 0.18, legend=c("Ve","Vp","Vc"),col=2:4, lty="dashed", lwd = 3, cex=1.5)
+```
+
+#### GEV $\chi=0$ ####
+Recall : $y_i \sim \text{GEV}(\pi\sin(x_i/10),0.5,0)$ and $x_i \in [1,20*\pi]$
+```{r}
+plot(res_corrected_1000.sin.gev.0$err$qu,(res_corrected_1000.sin.gev.0$err$sd-res_corrected_1000.sin.gev.0$err$Ve)/res_corrected_1000.sin.gev.0$err$sd,'b',lwd=3,lty="dashed",col=2,main="error on standard deviation for gev",xlab="tau",ylab="error",ylim=c(-0.03,0.21))
+lines(res_corrected_1000.sin.gev.0$err$qu,(res_corrected_1000.sin.gev.0$err$sd-res_corrected_1000.sin.gev.0$err$Vp)/res_corrected_1000.sin.gev.0$err$sd,'b',lwd=3,lty="dashed",col=3)
+lines(res_corrected_1000.sin.gev.0$err$qu,(res_corrected_1000.sin.gev.0$err$sd-res_corrected_1000.sin.gev.0$err$Vc)/res_corrected_1000.sin.gev.0$err$sd,'b',lwd=3,lty="dashed",col=4)
+
+lines(res_1000.sin.gev.0$err$qu,(res_1000.sin.gev.0$err$sd-res_1000.sin.gev.0$err$Ve)/res_1000.sin.gev.0$err$sd,'b',lwd=1,col=2)
+lines(res_1000.sin.gev.0$err$qu,(res_1000.sin.gev.0$err$sd-res_1000.sin.gev.0$err$Vp)/res_1000.sin.gev.0$err$sd,'b',lwd=1,col=3)
+lines(res_1000.sin.gev.0$err$qu,(res_1000.sin.gev.0$err$sd-res_1000.sin.gev.0$err$Vc)/res_1000.sin.gev.0$err$sd,'b',lwd=1,col=4)
+
+lines(c(-1,2),c(0,0),'b',lwd=1,lty="dashed",col=1)
+legend(0.5, 0.2, legend=c("Ve","Vp","Vc"),col=2:4, lty="dashed", lwd = 3, cex=1.5)
+```
+
+#### GEV $\chi=0.2$ ####
+Recall : $y_i \sim \text{GEV}(\pi\sin(x_i/10),0.5,0.2)$ and $x_i \in [1,20*\pi]$
+```{r}
+plot(res_corrected_1000.sin.gev.0.2$err$qu,(res_corrected_1000.sin.gev.0.2$err$sd-res_corrected_1000.sin.gev.0.2$err$Ve)/res_corrected_1000.sin.gev.0.2$err$sd,'b',lwd=3,lty="dashed",col=2,main="error on standard deviation for gev",xlab="tau",ylab="error",ylim=c(-0.03,0.35))
+lines(res_corrected_1000.sin.gev.0.2$err$qu,(res_corrected_1000.sin.gev.0.2$err$sd-res_corrected_1000.sin.gev.0.2$err$Vp)/res_corrected_1000.sin.gev.0.2$err$sd,'b',lwd=3,lty="dashed",col=3)
+lines(res_corrected_1000.sin.gev.0.2$err$qu,(res_corrected_1000.sin.gev.0.2$err$sd-res_corrected_1000.sin.gev.0.2$err$Vc)/res_corrected_1000.sin.gev.0.2$err$sd,'b',lwd=3,lty="dashed",col=4)
+
+lines(res_1000.sin.gev.0.2$err$qu,(res_1000.sin.gev.0.2$err$sd-res_1000.sin.gev.0.2$err$Ve)/res_1000.sin.gev.0.2$err$sd,'b',lwd=1,col=2)
+lines(res_1000.sin.gev.0.2$err$qu,(res_1000.sin.gev.0.2$err$sd-res_1000.sin.gev.0.2$err$Vp)/res_1000.sin.gev.0.2$err$sd,'b',lwd=1,col=3)
+lines(res_1000.sin.gev.0.2$err$qu,(res_1000.sin.gev.0.2$err$sd-res_1000.sin.gev.0.2$err$Vc)/res_1000.sin.gev.0.2$err$sd,'b',lwd=1,col=4)
+
+lines(c(-1,2),c(0,0),'b',lwd=1,lty="dashed",col=1)
+legend(0.5, 0.2, legend=c("Ve","Vp","Vc"),col=2:4, lty="dashed", lwd = 3, cex=1.5)
+```
+
+
+### Poly model ###
+#### gauss lin ####
+Recall : $y_i \sim \mathcal{N}(x(x-0.2)(x-0.6),0.5)$ and $x_i \in [0,1]$ 
+```{r}
+plot(res_corrected_1000.poly.gauss_lin$err$qu,(res_corrected_1000.poly.gauss_lin$err$sd-res_corrected_1000.poly.gauss_lin$err$Ve)/res_corrected_1000.poly.gauss_lin$err$sd,'b',lwd=3,lty="dashed",col=2,main="error on standard deviation for gauss lin",xlab="tau",ylab="error",ylim=c(-0.12,0.25))
+lines(res_corrected_1000.poly.gauss_lin$err$qu,(res_corrected_1000.poly.gauss_lin$err$sd-res_corrected_1000.poly.gauss_lin$err$Vp)/res_corrected_1000.poly.gauss_lin$err$sd,'b',lwd=3,lty="dashed",col=3)
+lines(res_corrected_1000.poly.gauss_lin$err$qu,(res_corrected_1000.poly.gauss_lin$err$sd-res_corrected_1000.poly.gauss_lin$err$Vc)/res_corrected_1000.poly.gauss_lin$err$sd,'b',lwd=3,lty="dashed",col=4)
+
+lines(res_1000.poly.gauss_lin$err$qu,(res_1000.poly.gauss_lin$err$sd-res_1000.poly.gauss_lin$err$Ve)/res_1000.poly.gauss_lin$err$sd,'b',lwd=1,col=2)
+lines(res_1000.poly.gauss_lin$err$qu,(res_1000.poly.gauss_lin$err$sd-res_1000.poly.gauss_lin$err$Vp)/res_1000.poly.gauss_lin$err$sd,'b',lwd=1,col=3)
+lines(res_1000.poly.gauss_lin$err$qu,(res_1000.poly.gauss_lin$err$sd-res_1000.poly.gauss_lin$err$Vc)/res_1000.poly.gauss_lin$err$sd,'b',lwd=1,col=4)
+
+lines(c(-1,2),c(0,0),'b',lwd=1,lty="dashed",col=1)
+legend(0.5, 0.25, legend=c("Ve","Vp","Vc"),col=2:4, lty="dashed", lwd = 3, cex=1.5)
+```
+
+#### gauss ####
+Recall : $y_i \sim \mathcal{N}(x(x-0.2)(x-0.6),0.5)$ and $x_i \in [0,1]$ 
+```{r}
+plot(res_corrected_1000.poly.gauss_lin$err$qu,(res_corrected_1000.poly.gauss$err$sd-res_corrected_1000.poly.gauss$err$Ve)/res_corrected_1000.poly.gauss$err$sd,'b',lwd=3,lty="dashed",col=2,main="error on standard deviation for gauss",xlab="tau",ylab="error",ylim=c(-0.03,0.3))
+lines(res_corrected_1000.poly.gauss$err$qu,(res_corrected_1000.poly.gauss$err$sd-res_corrected_1000.poly.gauss$err$Vp)/res_corrected_1000.poly.gauss$err$sd,'b',lwd=3,lty="dashed",col=3)
+lines(res_corrected_1000.poly.gauss$err$qu,(res_corrected_1000.poly.gauss$err$sd-res_corrected_1000.poly.gauss$err$Vc)/res_corrected_1000.poly.gauss$err$sd,'b',lwd=3,lty="dashed",col=4)
+
+lines(res_1000.poly.gauss_lin$err$qu,(res_1000.poly.gauss$err$sd-res_1000.poly.gauss$err$Ve)/res_1000.poly.gauss$err$sd,'b',lwd=1,col=2)
+lines(res_1000.poly.gauss$err$qu,(res_1000.poly.gauss$err$sd-res_1000.poly.gauss$err$Vp)/res_1000.poly.gauss$err$sd,'b',lwd=1,col=3)
+lines(res_1000.poly.gauss$err$qu,(res_1000.poly.gauss$err$sd-res_1000.poly.gauss$err$Vc)/res_1000.poly.gauss$err$sd,'b',lwd=1,col=4)
+
+lines(c(-1,2),c(0,0),'b',lwd=1,lty="dashed",col=1)
+legend(0.5, 0.3, legend=c("Ve","Vp","Vc"),col=2:4, lty="dashed", lwd = 3, cex=1.5)
+```
+
+#### GEV $\chi=0$ ####
+Recall : $y_i \sim \text{GEV}(x(x-0.2)(x-0.6),0.5,0)$ and $x_i \in [0,1]$
+```{r}
+plot(res_corrected_1000.poly.gev.0$err$qu,(res_corrected_1000.poly.gev.0$err$sd-res_corrected_1000.poly.gev.0$err$Ve)/res_corrected_1000.poly.gev.0$err$sd,'b',lwd=3,lty="dashed",col=2,main="error on standard deviation for gev",xlab="tau",ylab="error",ylim=c(-0.12,0.3))
+lines(res_corrected_1000.poly.gev.0$err$qu,(res_corrected_1000.poly.gev.0$err$sd-res_corrected_1000.poly.gev.0$err$Vp)/res_corrected_1000.poly.gev.0$err$sd,'b',lwd=3,lty="dashed",col=3)
+lines(res_corrected_1000.poly.gev.0$err$qu,(res_corrected_1000.poly.gev.0$err$sd-res_corrected_1000.poly.gev.0$err$Vc)/res_corrected_1000.poly.gev.0$err$sd,'b',lwd=3,lty="dashed",col=4)
+
+lines(res_1000.poly.gev.0$err$qu,(res_1000.poly.gev.0$err$sd-res_1000.poly.gev.0$err$Ve)/res_1000.poly.gev.0$err$sd,'b',lwd=1,col=2)
+lines(res_1000.poly.gev.0$err$qu,(res_1000.poly.gev.0$err$sd-res_1000.poly.gev.0$err$Vp)/res_1000.poly.gev.0$err$sd,'b',lwd=1,col=3)
+lines(res_1000.poly.gev.0$err$qu,(res_1000.poly.gev.0$err$sd-res_1000.poly.gev.0$err$Vc)/res_1000.poly.gev.0$err$sd,'b',lwd=1,col=4)
+
+lines(c(-1,2),c(0,0),'b',lwd=1,lty="dashed",col=1)
+legend(0.5, 0.3, legend=c("Ve","Vp","Vc"),col=2:4, lty="dashed", lwd = 3, cex=1.5)
+```
+
+#### GEV $\chi=0.2$ ####
+Recall : $y_i \sim \text{GEV}(x(x-0.2)(x-0.6),0.5,0.2)$ and $x_i \in [0,1]$
+```{r}
+plot(res_corrected_1000.poly.gev.0.2$err$qu,(res_corrected_1000.poly.gev.0.2$err$sd-res_corrected_1000.poly.gev.0.2$err$Ve)/res_corrected_1000.poly.gev.0.2$err$sd,'b',lwd=3,lty="dashed",col=2,main="error on standard deviation for gev chi=0.2",xlab="tau",ylab="error",ylim=c(-0.05,0.55))
+lines(res_corrected_1000.poly.gev.0.2$err$qu,(res_corrected_1000.poly.gev.0.2$err$sd-res_corrected_1000.poly.gev.0.2$err$Vp)/res_corrected_1000.poly.gev.0.2$err$sd,'b',lwd=3,lty="dashed",col=3)
+lines(res_corrected_1000.poly.gev.0.2$err$qu,(res_corrected_1000.poly.gev.0.2$err$sd-res_corrected_1000.poly.gev.0.2$err$Vc)/res_corrected_1000.poly.gev.0.2$err$sd,'b',lwd=3,lty="dashed",col=4)
+
+lines(res_1000.poly.gev.0.2$err$qu,(res_1000.poly.gev.0.2$err$sd-res_1000.poly.gev.0.2$err$Ve)/res_1000.poly.gev.0.2$err$sd,'b',lwd=1,col=2)
+lines(res_1000.poly.gev.0.2$err$qu,(res_1000.poly.gev.0.2$err$sd-res_1000.poly.gev.0.2$err$Vp)/res_1000.poly.gev.0.2$err$sd,'b',lwd=1,col=3)
+lines(res_1000.poly.gev.0.2$err$qu,(res_1000.poly.gev.0.2$err$sd-res_1000.poly.gev.0.2$err$Vc)/res_1000.poly.gev.0.2$err$sd,'b',lwd=1,col=4)
+
+lines(c(-1,2),c(0,0),'b',lwd=1,lty="dashed",col=1)
+legend(0.5, 0.36, legend=c("Ve","Vp","Vc"),col=2:4, lty="dashed", lwd = 3, cex=1.5)
+```
+
+
+### Exp model ###
+#### gauss lin ####
+Recall : $y_i \sim \mathcal{N}(e^{2x}-3.75,0.5)$ and $x_i \in [0,1]$ 
+```{r}
+plot(res_corrected_1000.exp.gauss_lin$err$qu,(res_corrected_1000.exp.gauss_lin$err$sd-res_corrected_1000.exp.gauss_lin$err$Ve)/res_corrected_1000.exp.gauss_lin$err$sd,'b',lwd=3,lty="dashed",col=2,main="error on standard deviation for gauss lin",xlab="tau",ylab="error",ylim=c(-0.15,0.25))
+lines(res_corrected_1000.exp.gauss_lin$err$qu,(res_corrected_1000.exp.gauss_lin$err$sd-res_corrected_1000.exp.gauss_lin$err$Vp)/res_corrected_1000.exp.gauss_lin$err$sd,'b',lwd=3,lty="dashed",col=3)
+lines(res_corrected_1000.exp.gauss_lin$err$qu,(res_corrected_1000.exp.gauss_lin$err$sd-res_corrected_1000.exp.gauss_lin$err$Vc)/res_corrected_1000.exp.gauss_lin$err$sd,'b',lwd=3,lty="dashed",col=4)
+
+lines(res_1000.exp.gauss_lin$err$qu,(res_1000.exp.gauss_lin$err$sd-res_1000.exp.gauss_lin$err$Ve)/res_1000.exp.gauss_lin$err$sd,'b',lwd=1,col=2)
+lines(res_1000.exp.gauss_lin$err$qu,(res_1000.exp.gauss_lin$err$sd-res_1000.exp.gauss_lin$err$Vp)/res_1000.exp.gauss_lin$err$sd,'b',lwd=1,col=3)
+lines(res_1000.exp.gauss_lin$err$qu,(res_1000.exp.gauss_lin$err$sd-res_1000.exp.gauss_lin$err$Vc)/res_1000.exp.gauss_lin$err$sd,'b',lwd=1,col=4)
+
+lines(c(-1,2),c(0,0),'b',lwd=1,lty="dashed",col=1)
+legend(0.5, 0.25, legend=c("Ve","Vp","Vc"),col=2:4, lty="dashed", lwd = 3, cex=1.5)
+```
+
+#### gauss ####
+Recall : $y_i \sim \mathcal{N}(e^{2x}-3.75,0.5)$ and $x_i \in [0,1]$ 
+```{r}
+plot(res_corrected_1000.exp.gauss_lin$err$qu,(res_corrected_1000.exp.gauss$err$sd-res_corrected_1000.exp.gauss$err$Ve)/res_corrected_1000.exp.gauss$err$sd,'b',lwd=3,lty="dashed",col=2,main="error on standard deviation for gauss",xlab="tau",ylab="error",ylim=c(-0.06,0.3))
+lines(res_corrected_1000.exp.gauss$err$qu,(res_corrected_1000.exp.gauss$err$sd-res_corrected_1000.exp.gauss$err$Vp)/res_corrected_1000.exp.gauss$err$sd,'b',lwd=3,lty="dashed",col=3)
+lines(res_corrected_1000.exp.gauss$err$qu,(res_corrected_1000.exp.gauss$err$sd-res_corrected_1000.exp.gauss$err$Vc)/res_corrected_1000.exp.gauss$err$sd,'b',lwd=3,lty="dashed",col=4)
+
+lines(res_1000.exp.gauss_lin$err$qu,(res_1000.exp.gauss$err$sd-res_1000.exp.gauss$err$Ve)/res_1000.exp.gauss$err$sd,'b',lwd=1,col=2)
+lines(res_1000.exp.gauss$err$qu,(res_1000.exp.gauss$err$sd-res_1000.exp.gauss$err$Vp)/res_1000.exp.gauss$err$sd,'b',lwd=1,col=3)
+lines(res_1000.exp.gauss$err$qu,(res_1000.exp.gauss$err$sd-res_1000.exp.gauss$err$Vc)/res_1000.exp.gauss$err$sd,'b',lwd=1,col=4)
+
+lines(c(-1,2),c(0,0),'b',lwd=1,lty="dashed",col=1)
+legend(0.5, 0.3, legend=c("Ve","Vp","Vc"),col=2:4, lty="dashed", lwd = 3, cex=1.5)
+```
+
+#### GEV $\chi=0$ ####
+Recall : $y_i \sim \text{GEV}(e^{2x}-3.75,0.5,0)$ and $x_i \in [0,1]$
+```{r}
+plot(res_corrected_1000.exp.gev.0$err$qu,(res_corrected_1000.exp.gev.0$err$sd-res_corrected_1000.exp.gev.0$err$Ve)/res_corrected_1000.exp.gev.0$err$sd,'b',lwd=3,lty="dashed",col=2,main="error on standard deviation for gev",xlab="tau",ylab="error",ylim=c(-0.12,0.3))
+lines(res_corrected_1000.exp.gev.0$err$qu,(res_corrected_1000.exp.gev.0$err$sd-res_corrected_1000.exp.gev.0$err$Vp)/res_corrected_1000.exp.gev.0$err$sd,'b',lwd=3,lty="dashed",col=3)
+lines(res_corrected_1000.exp.gev.0$err$qu,(res_corrected_1000.exp.gev.0$err$sd-res_corrected_1000.exp.gev.0$err$Vc)/res_corrected_1000.exp.gev.0$err$sd,'b',lwd=3,lty="dashed",col=4)
+
+lines(res_1000.exp.gev.0$err$qu,(res_1000.exp.gev.0$err$sd-res_1000.exp.gev.0$err$Ve)/res_1000.exp.gev.0$err$sd,'b',lwd=1,col=2)
+lines(res_1000.exp.gev.0$err$qu,(res_1000.exp.gev.0$err$sd-res_1000.exp.gev.0$err$Vp)/res_1000.exp.gev.0$err$sd,'b',lwd=1,col=3)
+lines(res_1000.exp.gev.0$err$qu,(res_1000.exp.gev.0$err$sd-res_1000.exp.gev.0$err$Vc)/res_1000.exp.gev.0$err$sd,'b',lwd=1,col=4)
+
+lines(c(-1,2),c(0,0),'b',lwd=1,lty="dashed",col=1)
+legend(0.5, 0.3, legend=c("Ve","Vp","Vc"),col=2:4, lty="dashed", lwd = 3, cex=1.5)
+```
+
+#### GEV $\chi=0.2$ ####
+Recall : $y_i \sim \text{GEV}(e^{2x}-3.75,0.5,0.2)$ and $x_i \in [0,1]$
+```{r}
+plot(res_corrected_1000.exp.gev.0.2$err$qu,(res_corrected_1000.exp.gev.0.2$err$sd-res_corrected_1000.exp.gev.0.2$err$Ve)/res_corrected_1000.exp.gev.0.2$err$sd,'b',lwd=3,lty="dashed",col=2,main="error on standard deviation for gev chi=0.2",xlab="tau",ylab="error",ylim=c(-0.07,0.4))
+lines(res_corrected_1000.exp.gev.0.2$err$qu,(res_corrected_1000.exp.gev.0.2$err$sd-res_corrected_1000.exp.gev.0.2$err$Vp)/res_corrected_1000.exp.gev.0.2$err$sd,'b',lwd=3,lty="dashed",col=3)
+lines(res_corrected_1000.exp.gev.0.2$err$qu,(res_corrected_1000.exp.gev.0.2$err$sd-res_corrected_1000.exp.gev.0.2$err$Vc)/res_corrected_1000.exp.gev.0.2$err$sd,'b',lwd=3,lty="dashed",col=4)
+
+lines(res_1000.exp.gev.0.2$err$qu,(res_1000.exp.gev.0.2$err$sd-res_1000.exp.gev.0.2$err$Ve)/res_1000.exp.gev.0.2$err$sd,'b',lwd=1,col=2)
+lines(res_1000.exp.gev.0.2$err$qu,(res_1000.exp.gev.0.2$err$sd-res_1000.exp.gev.0.2$err$Vp)/res_1000.exp.gev.0.2$err$sd,'b',lwd=1,col=3)
+lines(res_1000.exp.gev.0.2$err$qu,(res_1000.exp.gev.0.2$err$sd-res_1000.exp.gev.0.2$err$Vc)/res_1000.exp.gev.0.2$err$sd,'b',lwd=1,col=4)
+
+lines(c(-1,2),c(0,0),'b',lwd=1,lty="dashed",col=1)
+legend(0.5, 0.36, legend=c("Ve","Vp","Vc"),col=2:4, lty="dashed", lwd = 3, cex=1.5)
+```
+
+# Conclusion #
+In conclusion, when our purpose was to analyze the accuracy of qgam's confidence indicator, we encounter an unexpected bias over the prediction which wan be explained (partially at least) by the use of the elf loss. In addition, we have found a way to correct the bias due to the elf loss, but this method need some information over the distribution of $y\mid x$. This method also require to know the value of $h$ (recall that $h$ is a value that quantify the differency between the pinball loss and the elf loss, this value can be selected automatically by qgam or specified). Here are some ideas about future improvements : 
+
+- Until now, we have specified a value of $h$ then make the correction but if we can find a way to access to the value of $h$ automatically computed by qgam, it will probably be more efficient.
+- Until now, we have supposed that the data follow a normal law with constant standard deviation, but we can try to find an approximation of this correction that doesn't require that much information.
+- We have noticed that when we compare the results with and without correction (this simulation was also performed with different $h$) that bias aren't of the same sign. It's possible that we can obtain multiple experts by using different value of $h$ with and without correction, then aggregate them to obtain a better regression.
+- It's know that when $h$ is big, the computation cost decrease but the bias increase. In contrary, when $h$ gets closer to 0, the bias decrease, but the computational cost increase. Maybe using a big value of $h$ with the correction can lead to descent results with a smaller computation cost.
